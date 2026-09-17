@@ -5,6 +5,11 @@
   "bin": {
     "ccursor": "installer/dist/cli.cjs"
   },
+  "files": [
+    "installer/dist/cli.cjs",
+    "installer/dist/models-catalog.json",
+    "installer/vsix/"
+  ],
   "engines": {
     "node": ">=18.0.0"
   },
