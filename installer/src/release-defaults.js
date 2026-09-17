@@ -118,6 +118,47 @@ function copyAsset(filename, log, { force = false } = {}) {
   return true;
 }
 
+/**
+ * Post-install configuration gaps the user still has to close by hand.
+ *
+ * Patching only redirects traffic to the local BYOK server; the server serves
+ * whatever `providers.json` declares. A fresh install leaves that file empty,
+ * so Cursor shows no custom models and the install looks like it did nothing.
+ * Surfacing this at the end of `install` turns a silent dead end into a step.
+ *
+ * @returns {string[]} lines to print, empty when the config is ready to use
+ */
+export function formatSetupNotice() {
+  const lines = [];
+
+  const providersPath = join(CCURSOR_DIR, PROVIDERS_FILE_NAME);
+  let providerCount = 0;
+  try {
+    const parsed = JSON.parse(readFileSync(providersPath, 'utf-8'));
+    providerCount = Array.isArray(parsed?.providers) ? parsed.providers.length : 0;
+  } catch {
+    providerCount = 0;
+  }
+  if (providerCount === 0) {
+    lines.push('No LLM provider configured yet — Cursor will show no custom models.');
+    lines.push('  Add one in the Cursor++ sidebar panel, or edit:');
+    lines.push(`  ${providersPath}`);
+  }
+
+  try {
+    const routes = JSON.parse(readFileSync(join(CCURSOR_DIR, ROUTES_FILE_NAME), 'utf-8'));
+    if (routes?.byokMode === 0) {
+      lines.push('BYOK mode is OFF (not signed in to Cursor, or onboarding unfinished).');
+      lines.push('  Finish Cursor sign-in, then flip the toggle in the Cursor++ panel.');
+    }
+  } catch {
+    // routes.json is rewritten on every install; an unreadable file is already
+    // reported by the release step above.
+  }
+
+  return lines;
+}
+
 export function releaseDefaults(log) {
   log?.('[defaults] Releasing to ~/.ccursor/...');
   mkdirSync(CCURSOR_DIR, { recursive: true });

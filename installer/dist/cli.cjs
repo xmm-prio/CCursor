@@ -652,6 +652,31 @@ function copyAsset(filename, log, { force = false } = {}) {
   log?.(`  ${filename} ${existed ? "updated" : "released"} (${size} KB)`);
   return true;
 }
+function formatSetupNotice() {
+  const lines = [];
+  const providersPath = (0, import_path5.join)(CCURSOR_DIR, PROVIDERS_FILE_NAME);
+  let providerCount = 0;
+  try {
+    const parsed = JSON.parse((0, import_fs5.readFileSync)(providersPath, "utf-8"));
+    providerCount = Array.isArray(parsed?.providers) ? parsed.providers.length : 0;
+  } catch {
+    providerCount = 0;
+  }
+  if (providerCount === 0) {
+    lines.push("No LLM provider configured yet \u2014 Cursor will show no custom models.");
+    lines.push("  Add one in the Cursor++ sidebar panel, or edit:");
+    lines.push(`  ${providersPath}`);
+  }
+  try {
+    const routes = JSON.parse((0, import_fs5.readFileSync)((0, import_path5.join)(CCURSOR_DIR, ROUTES_FILE_NAME), "utf-8"));
+    if (routes?.byokMode === 0) {
+      lines.push("BYOK mode is OFF (not signed in to Cursor, or onboarding unfinished).");
+      lines.push("  Finish Cursor sign-in, then flip the toggle in the Cursor++ panel.");
+    }
+  } catch {
+  }
+  return lines;
+}
 function releaseDefaults(log) {
   log?.("[defaults] Releasing to ~/.ccursor/...");
   (0, import_fs5.mkdirSync)(CCURSOR_DIR, { recursive: true });
@@ -3502,6 +3527,7 @@ async function install() {
   const pending = steps.filter((step) => step.applicable && !step.inspect(paths).ok);
   if (pending.length === 0) {
     ok("Already fully installed");
+    for (const line2 of formatSetupNotice()) warn(line2);
     info('To reinstall, run "ccursor uninstall" first');
     return;
   }
@@ -3525,8 +3551,9 @@ async function install() {
   console.log("");
   ok("Installation complete!");
   warn("Restart Cursor for changes to take effect.");
+  for (const line2 of formatSetupNotice()) warn(line2);
   for (const line2 of formatRemoteHostNotice(paths)) warn(line2);
-  info("Uninstall: npx @cometix/ccursor uninstall");
+  info("Uninstall: npx github:xmm-prio/CCursor uninstall");
 }
 
 // src/uninstall.js

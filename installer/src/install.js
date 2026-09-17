@@ -14,7 +14,7 @@
  */
 import { findCursorPathsDetailed, formatDiagnostic, formatInstallSelection, formatRemoteHostNotice } from './detect.js';
 import { hasBackup } from './backup.js';
-import { releaseDefaults } from './release-defaults.js';
+import { formatSetupNotice, releaseDefaults } from './release-defaults.js';
 import { resolveSteps } from './steps.js';
 
 const ok = msg => console.log(`\x1b[32m[OK]\x1b[0m ${msg}`);
@@ -44,6 +44,10 @@ export async function install() {
 
   if (pending.length === 0) {
     ok('Already fully installed');
+    // Still report config gaps: re-running install is exactly what a user does
+    // when BYOK "does nothing", and the cause is usually an empty providers.json
+    // rather than a missing patch.
+    for (const line of formatSetupNotice()) warn(line);
     info('To reinstall, run "ccursor uninstall" first');
     return;
   }
@@ -78,6 +82,7 @@ export async function install() {
   console.log('');
   ok('Installation complete!');
   warn('Restart Cursor for changes to take effect.');
+  for (const line of formatSetupNotice()) warn(line);
   for (const line of formatRemoteHostNotice(paths)) warn(line);
-  info('Uninstall: npx @cometix/ccursor uninstall');
+  info('Uninstall: npx github:xmm-prio/CCursor uninstall');
 }

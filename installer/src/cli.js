@@ -2,9 +2,11 @@
  * ccursor CLI — Cursor++ BYOK Installer
  *
  * Usage:
- *   npx @cometix/ccursor install     # Install extension + apply patches
- *   npx @cometix/ccursor uninstall   # Remove extension + restore patches
- *   npx @cometix/ccursor status      # Check installation status
+ *   npx github:xmm-prio/CCursor install     # Install extension + apply patches
+ *   npx github:xmm-prio/CCursor uninstall   # Remove extension + restore patches
+ *   npx github:xmm-prio/CCursor status      # Check installation status
+ *
+ * On Windows, a Cursor installed under Program Files needs an elevated shell.
  */
 
 import { install } from './install.js';

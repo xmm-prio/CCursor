@@ -56,6 +56,28 @@ npx git+https://github.com/xmm-prio/CCursor.git install
 Requires **Node.js >= 18**. Nothing else — the CLI bundle and the packaged
 extension are committed to this repository, so no build step runs on your machine.
 
+### After installing
+
+Patching only redirects traffic to the local BYOK server — the server still
+needs to know which models to serve. **A fresh install leaves
+`~/.ccursor/providers.json` empty, so Cursor shows no custom models and the
+install looks like it did nothing.** Restart Cursor, open the Cursor++ sidebar
+panel, and add a provider (or edit `providers.json` directly — see
+[Configuration](#configuration)).
+
+`install` reports any remaining gap at the end, including when BYOK mode is
+left OFF because you have not signed in to Cursor yet.
+
+### Windows: run elevated
+
+If Cursor lives under `C:\Program Files`, the patches cannot be written from a
+normal shell and the install fails or silently leaves nothing behind. Run the
+command from an **Administrator** PowerShell. Per-user installs under
+`%LOCALAPPDATA%\Programs\cursor` do not need this.
+
+Have several Cursor installs? The CLI picks the newest and prints the ones it
+skipped; override with `CCURSOR_CURSOR_ROOT=<path to resources/app>`.
+
 > Upgrading from a previous install? Run `uninstall` before `install`. The
 > injected router carries a version marker, and stacking a new install on top of
 > old patches will not take effect.

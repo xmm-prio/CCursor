@@ -56,6 +56,18 @@ npx git+https://github.com/xmm-prio/CCursor.git install
 
 要求 **Node.js >= 18**，仅此而已 —— CLI 与扩展包都已提交到仓库，安装时不会在你机器上执行任何构建。
 
+### 安装之后
+
+打补丁只是把流量劫持到本地 BYOK 服务器，而服务器提供哪些模型取决于配置。**全新安装时 `~/.ccursor/providers.json` 是空的，Cursor 里看不到任何自定义模型，看起来就像"没有有效安装"。** 请重启 Cursor，打开侧边栏 Cursor++ 面板添加服务商，或直接编辑 `providers.json`（格式见[配置](#配置)一节）。
+
+`install` 结束时会提示所有尚未完成的配置项，包括因未登录 Cursor 而导致 BYOK 模式处于 OFF 的情况。
+
+### Windows：需要管理员权限
+
+如果 Cursor 装在 `C:\Program Files` 下，普通 shell 没有写权限，安装会失败或看似执行了却什么都没留下。请在**管理员** PowerShell 中执行。装在 `%LOCALAPPDATA%\Programs\cursor` 的单用户安装则不需要提权。
+
+有多份 Cursor 安装？CLI 会选版本最高的那份，并打印被跳过的路径；可用 `CCURSOR_CURSOR_ROOT=<resources/app 路径>` 覆盖。
+
 > 从旧版本升级？请先 `uninstall` 再 `install`。注入的路由器带有版本标记，在旧补丁上叠加安装不会生效。
 
 ---
