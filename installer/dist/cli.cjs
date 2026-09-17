@@ -7532,8 +7532,8 @@ function patchInject(paths, log) {
 var import_fs9 = require("fs");
 
 // src/node-http11-router.js
-var HTTP11_ROUTER_VERSION_MARKER = "__byokHttp11RouterV3";
-var HTTP11_ROUTER_SOURCE_MARKER = "BYOK-HTTP11-ROUTER-V3";
+var HTTP11_ROUTER_VERSION_MARKER = "__byokHttp11RouterV4";
+var HTTP11_ROUTER_SOURCE_MARKER = "BYOK-HTTP11-ROUTER-V4";
 function buildNodeHttp11RouterPayload({ guardMarker, processLabel }) {
   const fallbackHost = JSON.stringify(DEFAULT_HOST);
   const fallbackPort = String(DEFAULT_PORT);
@@ -7552,6 +7552,11 @@ function buildNodeHttp11RouterPayload({ guardMarker, processLabel }) {
   var _proxyHttpGet=_http.get,_proxyHttpsGet=_https.get;
   var _directHttpOwner=_http.__vscodeOriginal||_http;
   var _directHttpRequest=(_http.__vscodeOriginal&&_http.__vscodeOriginal.request)||_proxyHttpRequest;
+  // Redirected unary calls share one keep-alive pool built from the original
+  // (un-proxy-patched) http module. That keeps the reason the old agent:false
+  // existed \u2014 never hand the request to VS Code's proxy agent \u2014 while dropping
+  // what it cost: a throwaway connect/close cycle per BidiAppend.
+  var _pool=new (_directHttpOwner.Agent||_http.Agent)({keepAlive:true,keepAliveMsecs:15000,maxSockets:64,maxFreeSockets:16,scheduling:"lifo",timeout:0});
   var ROUTES_PATH=_path.join(_os.homedir(),${ccursorDir},${routesFile});
   var FALLBACK_HOST=${fallbackHost},FALLBACK_PORT=${fallbackPort};
   var _title=String(process.env.VSCODE_PROCESS_TITLE||""),_widMatch=_title.match(/\\[(\\d+)-\\d+\\]/),WINDOW_ID=_widMatch?_widMatch[1]:null;
@@ -7603,7 +7608,7 @@ function buildNodeHttp11RouterPayload({ guardMarker, processLabel }) {
     if(Array.isArray(headers)){if(headers.length&&Array.isArray(headers[0])){for(var i=0;i<headers.length;i++)if(headers[i]&&headers[i].length>=2)result[String(headers[i][0])]=headers[i][1];}else{for(var j=0;j+1<headers.length;j+=2)result[String(headers[j])]=headers[j+1];}return result;}
     if(typeof headers==="object")for(var key in headers)if(Object.prototype.hasOwnProperty.call(headers,key))result[key]=headers[key];return result;}
   function routeHeaders(headers){var result=cloneHeaders(headers),hasWid=false;for(var key in result){var lower=key.toLowerCase();if(lower==="host"||lower===":authority")delete result[key];else if(lower==="x-client-wid")hasWid=true;}if(WINDOW_ID&&!hasWid)result["x-client-wid"]=WINDOW_ID;result["x-byok-route-source"]=PROCESS_LABEL;return result;}
-  function localOptions(options){var result=Object.assign({},options||{});result.headers=routeHeaders(result.headers);result.agent=false;delete result.host;delete result.servername;delete result.createConnection;delete result.ALPNProtocols;return result;}
+  function localOptions(options){var result=Object.assign({},options||{});result.headers=routeHeaders(result.headers);result.agent=_pool;delete result.host;delete result.servername;delete result.createConnection;delete result.ALPNProtocols;return result;}
   function rewriteOptions(options){var result=localOptions(options);result.protocol="http:";result.hostname=state.host;result.port=state.port;return result;}
   function rewriteUrl(parsed){var path=parsed.path||"/";return state.base+(path.charAt(0)==="/"?path:"/"+path);}
   function directRequest(parsed,second,callback){var cb=typeof second==="function"?second:callback;if(parsed.kind==="object")return _directHttpRequest.call(_directHttpOwner,rewriteOptions(parsed.raw),cb);var options=typeof second==="function"||second==null?{}:second;return _directHttpRequest.call(_directHttpOwner,rewriteUrl(parsed),localOptions(options),cb);}
@@ -7619,7 +7624,7 @@ function buildNodeHttp11RouterPayload({ guardMarker, processLabel }) {
 }
 function isNodeHttp11RouterPatched(source, guardMarker) {
   const head = source.slice(0, 24e3);
-  return head.includes(`/* ${HTTP11_ROUTER_SOURCE_MARKER} */`) && head.includes(HTTP11_ROUTER_VERSION_MARKER) && head.includes(guardMarker) && head.includes("_http.request=interceptRequest(false)") && head.includes("_https.request=interceptRequest(true)") && head.includes("_module.syncBuiltinESMExports") && head.includes("_chConnect();");
+  return head.includes(`/* ${HTTP11_ROUTER_SOURCE_MARKER} */`) && head.includes(HTTP11_ROUTER_VERSION_MARKER) && head.includes(guardMarker) && head.includes("_http.request=interceptRequest(false)") && head.includes("_https.request=interceptRequest(true)") && head.includes("_directHttpOwner.Agent||_http.Agent") && head.includes("result.agent=_pool") && head.includes("_module.syncBuiltinESMExports") && head.includes("_chConnect();");
 }
 
 // node_modules/acorn-walk/dist/walk.mjs
