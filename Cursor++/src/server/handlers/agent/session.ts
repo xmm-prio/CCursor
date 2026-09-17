@@ -202,17 +202,111 @@ export function markSessionClosed(session: AgentSession): void {
     notifyAll(session);
 }
 
-const sessions = new Map<string, AgentSession>();
+/**
+ * Registry entry of one requestId.
+ *
+ * `lease` is the ownership token of the RunSSE stream currently driving this
+ * requestId, or null while the session only exists because BidiAppend arrived
+ * first (the normal SSE handshake order) and no stream has claimed it yet.
+ */
+interface SessionEntry {
+    session: AgentSession;
+    lease: number | null;
+}
+
+const sessions = new Map<string, SessionEntry>();
+
+let leaseCounter = 0;
+
+/**
+ * Ownership handle a RunSSE stream holds over its requestId.
+ *
+ * `release()` is deliberately not "close this requestId": it only tears the
+ * session down while this lease is still the current one. A stream whose
+ * socket died can take an arbitrarily long time to unwind (it may be parked on
+ * an in-flight LLM stream), so its teardown can land *after* the client has
+ * reconnected and a newer stream has claimed the same requestId. Tearing the
+ * session down at that point would silently kill the live run.
+ */
+export interface SessionLease {
+    session: AgentSession;
+    release: () => void;
+}
+
+/** End a session for good: wake every waiter, drop the per-exec buffers. */
+function endSession(session: AgentSession, cancelledReason?: string): void {
+    if (cancelledReason !== undefined && session.cancelledReason === undefined)
+        session.cancelledReason = cancelledReason;
+    session.closed = true;
+    notifyAll(session);
+    clearExecChannels(session);
+}
 
 export function getOrCreateSession(requestId: string): AgentSession {
-    let session = sessions.get(requestId);
-    if (!session) {
+    let entry = sessions.get(requestId);
+    if (!entry) {
         // 复用 createEphemeralSession —— 两处各自写字面量时,新增字段容易只补一处
-        session = createEphemeralSession(requestId);
-        sessions.set(requestId, session);
+        entry = { session: createEphemeralSession(requestId), lease: null };
+        sessions.set(requestId, entry);
         logger.debug({ requestId }, '[SESSION] created');
     }
-    return session;
+    return entry.session;
+}
+
+/**
+ * Bind a RunSSE stream to its requestId and take ownership of the session.
+ *
+ * Three cases, and the third is the one that matters over a remote tunnel:
+ *
+ *   1. Nothing registered yet — create the session, the stream owns it.
+ *   2. Registered but unclaimed — BidiAppend queued the runRequest before the
+ *      stream arrived, which is the normal SSE handshake. Adopt that session
+ *      so the queued messages are not lost.
+ *   3. Already claimed by another stream — the only way a second RunSSE can
+ *      appear for a live requestId is a reconnect after the first stream's
+ *      socket died (SSH port forwarding / NAT drop). The old run is writing
+ *      into a dead socket, so it is cancelled and a fresh session is handed to
+ *      the reconnecting stream, carrying over whatever the old run had not
+ *      consumed yet.
+ */
+export function claimSession(requestId: string): SessionLease {
+    const previous = sessions.get(requestId);
+    let session: AgentSession;
+
+    if (!previous) {
+        session = createEphemeralSession(requestId);
+        logger.debug({ requestId }, '[SESSION] created');
+    }
+    else if (previous.lease === null) {
+        session = previous.session;
+    }
+    else {
+        session = createEphemeralSession(requestId);
+        session.messages = previous.session.messages.splice(0);
+        session.terminalsFolder = previous.session.terminalsFolder;
+        logger.warn(
+            { requestId, carriedMessages: session.messages.length },
+            '[SESSION] RunSSE reclaimed a live requestId — treating it as a reconnect and cancelling the abandoned run',
+        );
+        endSession(previous.session, 'superseded by a reconnect of the same requestId');
+    }
+
+    const lease = ++leaseCounter;
+    sessions.set(requestId, { session, lease });
+
+    return {
+        session,
+        release: () => {
+            const current = sessions.get(requestId);
+            if (!current || current.lease !== lease) {
+                logger.debug({ requestId }, '[SESSION] release skipped — requestId already owned by a newer stream');
+                return;
+            }
+            sessions.delete(requestId);
+            endSession(session);
+            logger.debug({ requestId }, '[SESSION] closed');
+        },
+    };
 }
 
 /** BidiAppend 调用时，将消息推入 session 队列 */
@@ -361,13 +455,18 @@ export async function waitForInteractionResponse(
     );
 }
 
+/**
+ * Unconditional teardown of a requestId, regardless of who owns it.
+ *
+ * Streams must use the lease returned by claimSession() instead — see the
+ * SessionLease docstring for why an unconditional close from a stream is a
+ * bug. This entry point remains for callers that legitimately have no lease.
+ */
 export function closeSession(requestId: string): void {
-    const session = sessions.get(requestId);
-    if (session) {
-        session.closed = true;
-        notifyAll(session);
-        clearExecChannels(session);
+    const entry = sessions.get(requestId);
+    if (entry) {
         sessions.delete(requestId);
+        endSession(entry.session);
         logger.debug({ requestId }, '[SESSION] closed');
     }
 }

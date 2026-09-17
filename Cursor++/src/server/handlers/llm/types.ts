@@ -40,6 +40,12 @@ export type LLMStreamEvent
     | { type: 'tool_use_delta', id: string, input: string }
     | { type: 'tool_use_done', id: string, arguments?: string }
     | { type: 'done', usage: LLMUsage, stopReason: 'end_turn' | 'tool_use' | 'max_tokens' | string }
+    /**
+     * 上游流被瞬时故障打断后重新发起同一请求。
+     * 语义: 本轮此前产出的所有事件作废, 从此刻起重新开始 —— 下游消费者
+     * 各自丢弃已累积的半截状态 (文本 / thinking / tool call)。
+     */
+    | { type: 'stream_restart', attempt: number, reason: string }
 
 /** Token 用量 */
 export interface LLMUsage {

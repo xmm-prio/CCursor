@@ -839,6 +839,29 @@ export async function* translateStream(
         // 实际 toolCallStarted + exec 由 AgentService 处理
         break
 
+      case 'stream_restart': {
+        // 上游流重连: 此前产出的帧全部作废, provider 会从头重放本轮。
+        // 客户端状态机: streaming_thinking → (thinkingCompleted) → waiting_server_next → (heartbeat) → inference
+        if (isThinking) {
+          yield thinkingCompleted(Date.now() - thinkingStartTime)
+          isThinking = false
+        }
+        streamLogger.warn({
+          attempt: event.attempt,
+          reason: event.reason,
+          discardedThinkingChars: thinkingChars,
+          discardedTextChars: textChars,
+        }, '[LLM] stream restarted, resetting translation state')
+        thinkingStartTime = Date.now()
+        tokenCount = 0
+        thinkingChars = 0
+        textChars = 0
+        lastContentTime = Date.now()
+        idleHintSent = false
+        yield heartbeat()
+        break
+      }
+
       case 'done': {
         yield stepCompleted(stepId, Date.now() - startTime)
 

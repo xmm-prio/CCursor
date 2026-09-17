@@ -30,6 +30,9 @@ export class OpenAIResponsesProvider implements LLMProvider {
   constructor(entry: ProviderEntry) {
     const opts: ConstructorParameters<typeof OpenAI>[0] = {
       apiKey: entry.auth.value,
+      // 显式固定 SDK 建连重试次数: 它只覆盖建流前的失败, 流中断由
+      // withStreamResilience 负责; 写死是为了让两者的乘积不随 SDK 默认值漂移
+      maxRetries: 2,
     }
     if (entry.baseUrl) {
       opts.baseURL = entry.baseUrl

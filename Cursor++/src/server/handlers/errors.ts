@@ -41,6 +41,8 @@ import {
   ErrorDetails_Error,
   ErrorDetailsSchema,
 } from '../gen/aiserver_v1_shared_pb'
+// retry 判定的单一来源 —— banner 的 is_retryable 与 provider 层流重试共用同一套启发式
+import { inferRetryable } from './llm/retryPolicy'
 
 export interface MakeByokErrorOptions {
   /** aiserver.v1.ErrorDetails.Error enum — 决定客户端走哪条 gating 分支 */
@@ -143,51 +145,6 @@ export function makeProviderError(cause: unknown, extra?: Record<string, string>
     },
     cause,
   })
-}
-
-/**
- * 启发式: 识别 retry 必然无效的错误类型。
- *
- * 覆盖的观测类 (实际截图编号 30-39):
- *   - 401/403 auth 错     → 图 38   (api key 错)
- *   - 404 路由错          → 图 31, 34 (baseUrl 错)
- *   - SDK auth 参数缺失   → 图 35   (Anthropic SDK 报 "Could not resolve authentication method")
- *   - Anthropic 400 协议错 → 图 33   (tool_use 无配对 tool_result)
- *   - Anthropic 400 校验错 → 图 39   (tool name 正则不匹配)
- *   - OpenAI 400 协议错   → 图 36   (no tool output for function call)
- *   - Gemini 400 校验错   → 图 37   (function_response.name empty)
- *
- * 未匹配的错误保守默认可 retry (图 30 stream 断 / 图 32 JSON 解析 / 429 / 5xx)。
- */
-function inferRetryable(rawMessage: string): boolean {
-  const msg = rawMessage.toLowerCase()
-
-  // 鉴权类 — retry 无效
-  if (/\b401\b/.test(msg) || msg.includes('unauthorized') || msg.includes('auth_error'))
-    return false
-  if (/\b403\b/.test(msg) || msg.includes('forbidden'))
-    return false
-  if (msg.includes('could not resolve authentication'))
-    return false
-
-  // 路由 / endpoint 错 — retry 无效
-  if (/\b404\b/.test(msg) || msg.includes('page not found') || msg.includes('not found'))
-    return false
-
-  // upstream 400 请求体校验错 — retry 无效 (我们自己 codec / builder bug)
-  if (msg.includes('invalid_request_error'))
-    return false
-  if (msg.includes('tool_use ids were found without tool_result'))
-    return false
-  if (msg.includes('no tool output found for function call'))
-    return false
-  if (msg.includes('function_response.name'))
-    return false
-  if (msg.includes('does not match pattern'))
-    return false
-
-  // 其他 — 可 retry
-  return true
 }
 
 /** 工具执行层错误 (非用户 abort, 非 tool 自身返回的 error envelope) */

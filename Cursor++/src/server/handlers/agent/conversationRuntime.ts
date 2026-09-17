@@ -496,6 +496,39 @@ function flushPendingAssistantPrefix(params: {
 }
 
 /**
+ * Drop everything the current round accumulated before an aborted stream attempt.
+ *
+ * A `stream_restart` event declares every prior event of the round void: the
+ * provider replays the round from scratch. The edit-streaming tables are run
+ * scoped, so only the callIds registered by the aborted attempt are removed —
+ * entries belonging to earlier rounds must survive.
+ */
+export function discardRestartedRoundState(params: {
+  pendingToolCalls: ToolCallInfo[]
+  inflightToolCalls: Map<string, { name: string, input: string }>
+  roundAssistantBlocks: LLMContentBlock[]
+  attemptEditCallIds: Set<string>
+}): {
+  currentThinking: string
+  currentText: string
+} {
+  const { pendingToolCalls, inflightToolCalls, roundAssistantBlocks, attemptEditCallIds } = params
+
+  pendingToolCalls.length = 0
+  inflightToolCalls.clear()
+  roundAssistantBlocks.length = 0
+
+  for (const callId of attemptEditCallIds) {
+    editExtractors.delete(callId)
+    editPathSent.delete(callId)
+    editStreamDiagnostics.delete(callId)
+  }
+  attemptEditCallIds.clear()
+
+  return { currentThinking: '', currentText: '' }
+}
+
+/**
  * 在 Agent Run 流内执行 inline auto-summarize。
  *
  * 对应客户端分析中的链路①：服务端在 BiDi 流中自主决定 summarize，
@@ -987,6 +1020,8 @@ export async function* handleConversationRun(
     const pendingToolCalls: ToolCallInfo[] = []
     const inflightToolCalls = new Map<string, { name: string, input: string }>()
     const roundAssistantBlocks: LLMContentBlock[] = []
+    // 本次 attempt 在 run 级 edit 表里登记的 callId —— stream_restart 时据此精确回收
+    const attemptEditCallIds = new Set<string>()
     let currentThinking = ''
     let currentText = ''
 
@@ -1060,6 +1095,7 @@ export async function* handleConversationRun(
             if (EDIT_TOOL_NAMES.has(event.name)) {
               editExtractors.set(event.id, new EditDeltaExtractor(event.name))
               editStreamDiagnostics.set(event.id, { deltaCount: 0, streamContent: '' })
+              attemptEditCallIds.add(event.id)
               logger.debug({ callId: event.id, tool: event.name }, '[EDIT_T] 1.tool_use_start → extractor created')
             }
             break
@@ -1108,6 +1144,7 @@ export async function* handleConversationRun(
           }
           case 'tool_use_done': {
             editExtractors.delete(event.id)
+            attemptEditCallIds.delete(event.id)
             const pathWasSent = editPathSent.has(event.id)
             const streamDiag = editStreamDiagnostics.get(event.id)
             const current = inflightToolCalls.get(event.id)
@@ -1144,6 +1181,24 @@ export async function* handleConversationRun(
               editPathSent.delete(event.id)
               editStreamDiagnostics.delete(event.id)
             }
+            break
+          }
+          case 'stream_restart': {
+            logger.warn({
+              conversationId: parsed.conversationId,
+              round,
+              attempt: event.attempt,
+              reason: event.reason,
+              discardedBlocks: roundAssistantBlocks.length,
+              discardedToolCalls: pendingToolCalls.length,
+              discardedInflightToolCalls: inflightToolCalls.size,
+            }, '[LLM_RETRY] stream restarted, discarding partial round state')
+            ;({ currentThinking, currentText } = discardRestartedRoundState({
+              pendingToolCalls,
+              inflightToolCalls,
+              roundAssistantBlocks,
+              attemptEditCallIds,
+            }))
             break
           }
           case 'done':

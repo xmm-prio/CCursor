@@ -8,6 +8,7 @@ import cors from '@fastify/cors'
  * 在 extension host 进程内运行，通过 startServer/stopServer 管理生命周期。
  */
 import Fastify from 'fastify'
+import { STREAMING_TRANSPORT_OPTIONS, tuneStreamingTransport } from './config/connectionTuning'
 import { ensureProvidersFile } from './config/providersStore'
 import { buildRoutesPayload, serializeRoutesFrames } from './config/routesPayload'
 import { ensureRoutesFile, loadRoutes, toggleByokMode } from './config/routesStore'
@@ -186,7 +187,12 @@ export async function startServer(opts: StartServerOptions): Promise<{ host: str
     loggerInstance: logger,
     disableRequestLogging: true,
     bodyLimit: 10 * 1024 * 1024,
+    ...STREAMING_TRANSPORT_OPTIONS,
   })
+
+  // Agent turns are single, minutes-long, mostly silent requests; over a
+  // remote tunnel they also need OS-level keepalive. See connectionTuning.ts.
+  tuneStreamingTransport(server.server)
 
   // onRequest: 绑定 windowId 到 AsyncLocalStorage, 后续整个处理链
   // 的 logger 调用都会自动路由到正确的窗口 (per-window SSE 推送)

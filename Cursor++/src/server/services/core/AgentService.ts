@@ -31,7 +31,7 @@ import { registerCloneLineage } from '../../handlers/agent/cloneRegistry'
 import { ModelNotFoundError } from '../../handlers/models/mapper'
 import { makeByokConnectError, makeModelNotFoundError, makeProviderError } from '../../handlers/errors'
 import { ErrorDetails_Error } from '../../gen/aiserver_v1_shared_pb'
-import { closeSession, createEphemeralSession, getOrCreateSession, markSessionClosed, pushSessionMessage, waitForMessage } from '../../handlers/agent/session'
+import { claimSession, createEphemeralSession, markSessionClosed, pushSessionMessage, waitForMessage } from '../../handlers/agent/session'
 import { logger } from '../../logger'
 
 /**
@@ -159,7 +159,11 @@ export default (router: ConnectRouter) => {
       }
 
       logger.info({ requestId }, '[SVC] AgentService/RunSSE started')
-      const session = getOrCreateSession(requestId)
+      // Lease, not a bare lookup: over a forwarded port the client can
+      // reconnect this requestId while the previous stream is still unwinding,
+      // and only the lease keeps that teardown from killing the new run.
+      const lease = claimSession(requestId)
+      const session = lease.session
 
       try {
         const firstMsg = await waitForMessage(session)
@@ -237,7 +241,7 @@ export default (router: ConnectRouter) => {
         throw connErr
       }
       finally {
-        closeSession(requestId)
+        lease.release()
       }
     },
 

@@ -6,7 +6,7 @@ import { toJsonString } from '@bufbuild/protobuf'
 import { expect, it } from 'vitest'
 import { persistBlob } from '../database/blobs'
 import { getPersistedConversationCheckpoint, persistConversationCheckpoint } from '../database/checkpoints'
-import { resetAgentDatabaseForTests } from '../database/sqlite'
+import { closeAgentDatabase, resetAgentDatabaseForTests } from '../database/sqlite'
 import { AgentServerMessageSchema } from '../gen/agent_v1_pb'
 import { cacheBlob, getCachedBlob, resetBlobCacheForTests, warmupBlobsAsync } from '../handlers/agent/blobStore'
 import { checkpoint, kvMessage, summary, summaryCompleted, summaryStarted } from '../handlers/agent/stream'
@@ -348,7 +348,9 @@ async function withTempAgentDatabase(run: () => Promise<void>): Promise<void> {
   }
   finally {
     resetBlobCacheForTests()
-    await resetAgentDatabaseForTests()
+    // 必须 close 而非 reset —— reset 会立刻在 tempDir 里重开一个连接,
+    // Windows 下持有句柄的文件无法删除, rmSync 会 EPERM。
+    await closeAgentDatabase()
     if (prevDbPath === undefined)
       delete process.env.BYOK_AGENT_DB_PATH
     else process.env.BYOK_AGENT_DB_PATH = prevDbPath

@@ -5,6 +5,9 @@ import { OpenAIChatProvider } from './openai-chat';
 import { OpenAIResponsesProvider } from './openai-responses';
 import { GeminiProvider } from './gemini';
 import { resolveModel } from '../models/mapper';
+import { resetLlmTransport } from './proxyFetch';
+import { withStreamResilience } from './resilientProvider';
+import { STREAM_RETRY_POLICY } from './retryPolicy';
 import { makeByokConnectError } from '../errors';
 import { ErrorDetails_Error } from '../../gen/aiserver_v1_shared_pb';
 import type { ProviderStateStrategy } from './stateStrategy';
@@ -87,7 +90,8 @@ function instantiateProvider(entry: ProviderEntry): LLMProvider {
 function getProviderForEntry(entry: ProviderEntry): LLMProvider {
     let inst = providerInstances.get(entry.id);
     if (!inst) {
-        inst = instantiateProvider(entry);
+        // 全局唯一的实例化口子 —— 在这里包一层流重试即可覆盖全部 provider
+        inst = withStreamResilience(instantiateProvider(entry), STREAM_RETRY_POLICY);
         providerInstances.set(entry.id, inst);
     }
     return inst;
@@ -95,6 +99,9 @@ function getProviderForEntry(entry: ProviderEntry): LLMProvider {
 
 export function resetProviderInstanceCache(): void {
     providerInstances.clear();
+    // Cached providers own pooled undici dispatchers; drop them together so a
+    // changed proxyUrl does not leave stale connection pools behind.
+    resetLlmTransport();
 }
 
 function getStateStrategy(name: ProviderType): ProviderStateStrategy {

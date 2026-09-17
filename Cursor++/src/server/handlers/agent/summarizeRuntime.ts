@@ -155,6 +155,20 @@ export async function* handleSummarizeAction(
         });
 
         for await (const event of llmStream) {
+            if (event.type === 'stream_restart') {
+                // Upstream stream reconnected: the summary is replayed from scratch,
+                // so every character accumulated so far is void.
+                logger.warn({
+                    conversationId: parsed.conversationId,
+                    attempt: event.attempt,
+                    reason: event.reason,
+                    discardedChars: summaryText.length,
+                }, '[SUMMARIZE] LLM stream restarted, discarding partial summary');
+                summaryText = '';
+                yield heartbeat();
+                lastHeartbeatTime = Date.now();
+                continue;
+            }
             if (event.type === 'text_delta') {
                 summaryText += event.text;
                 yield summary(event.text);
