@@ -195,6 +195,14 @@ it('buildMessages produces official-style system and structured user content', (
                 content: 'Always reply in Chinese',
                 type: { global: {} },
               },
+              // source=USER 是 <user_rules> 的唯一判据：设置页里的 User Rules 带
+              // CursorRuleSource.USER，workspace 的 alwaysApply 规则不带 source，
+              // 二者分别落进 <user_rules> 与 <always_applied_workspace_rules>。
+              {
+                content: 'Prefer small diffs',
+                source: 'CURSOR_RULE_SOURCE_USER',
+                type: { global: {} },
+              },
               {
                 content: 'Use pnpm',
                 fullPath: '/workspace/app/.cursor/rules/build.md',
@@ -230,6 +238,7 @@ it('buildMessages produces official-style system and structured user content', (
   expect(preambleUserContent).toMatch(/<agent_transcripts>/)
   expect(preambleUserContent).toMatch(/<rules>/)
   expect(preambleUserContent).toMatch(/<user_rules/)
+  expect(preambleUserContent).toMatch(/<user_rule>Prefer small diffs<\/user_rule>/)
   expect(preambleUserContent).toMatch(/Always reply in Chinese/)
   expect(preambleUserContent).toMatch(/<always_applied_workspace_rules/)
   // fileGlobbed 正文不预载，读取匹配文件后才通过 related_cursor_rules 注入。

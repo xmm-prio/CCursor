@@ -97,9 +97,30 @@ export function buildSearchExecToolResult(
             const dc = resultCase(dr);
             return dc ? { result: dc } : { result: { case: 'error', value: { errorMessage: 'no result' } } };
         }
+        case 'searchConversationsToolCall': {
+            const cs = obj(execClientMsg.conversationSearchResult);
+            const rc = resultCase(cs);
+            return rc
+                ? { result: rc }
+                : { result: { case: 'error', value: { error: `conversation search returned no result for query ${JSON.stringify(str(input.query))}` } } };
+        }
         default:
             return null;
     }
+}
+
+/** ConversationSearchSource — int enum on the wire, readable label for the model. */
+const CONVERSATION_SEARCH_SOURCES: Record<string, string> = {
+    0: 'unknown',
+    1: 'local',
+    2: 'cloud-cache',
+    CONVERSATION_SEARCH_SOURCE_UNSPECIFIED: 'unknown',
+    CONVERSATION_SEARCH_SOURCE_LOCAL: 'local',
+    CONVERSATION_SEARCH_SOURCE_CLOUD_CACHE: 'cloud-cache',
+};
+
+function conversationSearchSource(value: unknown): string {
+    return CONVERSATION_SEARCH_SOURCES[String(value ?? 0)] ?? 'unknown';
 }
 
 export function normalizeSearchToolResult(
@@ -144,6 +165,22 @@ export function normalizeSearchToolResult(
                         value.totalDiagnostics,
                         fileDiagnostics.reduce((sum, file) => sum + arr<Record<string, unknown>>(file.diagnostics).length, 0),
                     ),
+                });
+            }
+            return envelope(resultCaseName || 'error', value);
+        case 'searchConversationsToolCall':
+            if (resultCaseName === 'success') {
+                return envelope('success', {
+                    hits: arr<Record<string, unknown>>(value.hits).map(hit => ({
+                        conversationId: str(hit.conversationId),
+                        title: str(hit.title),
+                        source: hit.source ?? 0,
+                        updatedAtMs: hit.updatedAtMs ?? 0,
+                        ...(hit.snippet !== undefined ? { snippet: str(hit.snippet) } : {}),
+                    })),
+                    truncated: bool(value.truncated),
+                    partial: bool(value.partial),
+                    rebuilding: bool(value.rebuilding),
                 });
             }
             return envelope(resultCaseName || 'error', value);
@@ -196,6 +233,26 @@ export function buildSearchToolResultText(
                     : `grep returned success but no formatted matches for pattern ${str(input.pattern ?? input.query)}`;
             }
             return `Grep ${resultCaseName || 'error'}: ${JSON.stringify(value)}`;
+        }
+        case 'searchConversationsToolCall': {
+            if (resultCaseName !== 'success')
+                return `Conversation search ${resultCaseName || 'error'}: ${JSON.stringify(value)}`;
+            const hits = arr<Record<string, unknown>>(value.hits);
+            if (hits.length === 0)
+                return `No conversations matched ${JSON.stringify(str(input.query))}`;
+            const lines = hits.map((hit) => {
+                const snippet = str(hit.snippet);
+                return `- ${str(hit.title, '(untitled)')} [${conversationSearchSource(hit.source)}] ${str(hit.conversationId)}${snippet ? `\n  ${snippet}` : ''}`;
+            });
+            const notes = [
+                bool(value.truncated) ? 'results truncated' : '',
+                bool(value.partial) ? 'index partial' : '',
+                bool(value.rebuilding) ? 'index rebuilding' : '',
+            ].filter(Boolean);
+            return truncate([
+                `Found ${hits.length} conversation(s)${notes.length > 0 ? ` (${notes.join(', ')})` : ''}:`,
+                ...lines,
+            ].join('\n'));
         }
         default:
             return null;

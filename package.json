@@ -1,0 +1,23 @@
+{
+  "name": "@xmm-prio/ccursor",
+  "version": "0.0.15",
+  "description": "Cursor++ BYOK for Cursor IDE — customized fork, installable straight from git",
+  "bin": {
+    "ccursor": "installer/dist/cli.cjs"
+  },
+  "dependencies": {
+    "acorn": "^8.14.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "build": "cd installer && npm run build:all"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xmm-prio/CCursor.git"
+  },
+  "license": "AGPL-3.0-or-later",
+  "private": false
+}

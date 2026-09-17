@@ -11,6 +11,15 @@
 import { fromBinary, toJson } from '@bufbuild/protobuf';
 import { AgentClientMessageSchema } from '../../gen/agent_v1_pb';
 import { logger } from '../../logger';
+import {
+    acquireExecWaiter,
+    clearExecChannels,
+    createExecChannelRegistry,
+    releaseExecWaiter,
+    routeExecEvent,
+    takeExecEvent,
+    type ExecChannel,
+} from './execChannels';
 
 /**
  * 后台 job 登记项。
@@ -41,6 +50,12 @@ export interface BackgroundJob {
 export interface AgentSession {
     requestId: string;
     messages: Array<Record<string, unknown>>;
+    /**
+     * Per-exec event buffers (see execChannels.ts). Exec-addressed client messages never
+     * enter `messages`; they are routed here so that each exec owns an isolated,
+     * bounded stream of events.
+     */
+    execChannels: Map<number, ExecChannel>;
     /** @deprecated 保留向后兼容，新代码使用 listeners */
     notify: (() => void) | null;
     listeners: Set<() => void>;
@@ -71,6 +86,7 @@ export function createEphemeralSession(requestId: string): AgentSession {
     return {
         requestId,
         messages: [],
+        execChannels: createExecChannelRegistry(),
         notify: null,
         listeners: new Set(),
         closed: false,
@@ -112,9 +128,10 @@ function extractCancelReason(json: Record<string, unknown>): string | undefined 
  * 消息入队的统一入口。两条上行通道 (bidi 的 pushSessionMessage、SSE 降级的
  * appendMessage) 都经过这里,保证不论客户端走哪条路都是同一套处理。
  *
- * 三类去向:
+ * 四类去向:
  *   injectContextAction — 丢弃 (见下)
  *   cancelAction        — 记为中断信号
+ *   exec 相关消息       — 进 execChannels 的 per-exec 缓冲 (见 execChannels.ts)
  *   其余                — 进 messages 供 waitForMessageMatching 消费
  *
  * 丢弃注入的理由: 我们不支持运行中注入,而客户端对"服务端没有应答"本就有兜底 ——
@@ -135,7 +152,7 @@ function ingestSessionMessage(session: AgentSession, json: Record<string, unknow
             logger.info({ requestId: session.requestId, reason: cancelReason }, '[CANCEL] client cancelled the run');
         }
     }
-    else {
+    else if (!routeExecEvent(session, json)) {
         session.messages.push(json);
     }
     notifyAll(session);
@@ -155,6 +172,20 @@ export function registerBackgroundJob(session: AgentSession, taskId: string, job
 /** 按 task_id 查找已登记的后台 job。 */
 export function getBackgroundJob(session: AgentSession, taskId: string): BackgroundJob | undefined {
     return session.backgroundJobs.get(taskId);
+}
+
+/**
+ * Drop every background job registration of this run.
+ *
+ * Called when the run is cancelled: the registry only exists to route later AwaitShell
+ * polls of the same run, so once the run is over the entries can only mislead.
+ */
+export function clearBackgroundJobs(session: AgentSession): BackgroundJob[] {
+    const jobs = [...session.backgroundJobs.values()];
+    if (jobs.length === 0) return jobs;
+    session.backgroundJobs.clear();
+    logger.info({ requestId: session.requestId, jobs: jobs.length }, '[SESSION] background job registry cleared');
+    return jobs;
 }
 
 function notifyAll(session: AgentSession): void {
@@ -222,14 +253,57 @@ export async function waitForMessageMatching(
     predicate: (msg: Record<string, unknown>) => boolean,
     timeoutMs: number | null = 30_000,
 ): Promise<Record<string, unknown> | null> {
-    // 先检查队列中是否已有匹配消息
-    const idx = session.messages.findIndex(predicate);
-    if (idx >= 0) {
-        return session.messages.splice(idx, 1)[0];
+    return waitForEvent(session, () => {
+        const idx = session.messages.findIndex(predicate);
+        return idx >= 0 ? session.messages.splice(idx, 1)[0] : null;
+    }, timeoutMs);
+}
+
+/**
+ * Wait for an event of a single exec, consumed from that exec's own channel.
+ *
+ * Same contract as waitForMessageMatching (null on close / cancel / timeout), but the
+ * search space is one exec's buffer instead of the shared queue, so two concurrently
+ * running execs can never consume each other's events.
+ */
+export async function waitForExecEventMatching(
+    session: AgentSession,
+    execMessageId: number,
+    predicate: (msg: Record<string, unknown>) => boolean,
+    timeoutMs: number | null = 30_000,
+): Promise<Record<string, unknown> | null> {
+    acquireExecWaiter(session, execMessageId);
+    try {
+        return await waitForEvent(
+            session,
+            () => takeExecEvent(session, execMessageId, predicate),
+            timeoutMs,
+            { execMessageId },
+        );
+    } finally {
+        releaseExecWaiter(session, execMessageId);
     }
+}
+
+/**
+ * Shared wait primitive: park on the session's listener set until `take` yields an
+ * event, the session ends (closed / cancelled), or the timeout elapses.
+ *
+ * `take` owns where the event comes from and removes it from its buffer; this function
+ * owns only the parking and wake-up.
+ */
+function waitForEvent(
+    session: AgentSession,
+    take: () => Record<string, unknown> | null,
+    timeoutMs: number | null,
+    logContext: Record<string, unknown> = {},
+): Promise<Record<string, unknown> | null> {
+    // 先检查缓冲里是否已有匹配消息
+    const buffered = take();
+    if (buffered) return Promise.resolve(buffered);
     // cancelled 与 closed 同样立即结束等待 —— 调用方 (wait.ts) 据
     // session.cancelledReason 区分二者,把前者转成 AgentRunAbortedError
-    if (session.closed || session.cancelledReason !== undefined) return null;
+    if (session.closed || session.cancelledReason !== undefined) return Promise.resolve(null);
 
     return new Promise<Record<string, unknown> | null>((resolve) => {
         let resolved = false;
@@ -245,17 +319,17 @@ export async function waitForMessageMatching(
             if (resolved)
                 return;
             cleanup();
-            logger.warn({ requestId: session.requestId, timeoutMs }, '[SESSION] waitForMessage timeout');
+            logger.warn({ requestId: session.requestId, timeoutMs, ...logContext }, '[SESSION] waitForMessage timeout');
             resolve(null);
         }, timeoutMs);
 
         const listener = () => {
             if (resolved)
                 return;
-            const i = session.messages.findIndex(predicate);
-            if (i >= 0) {
+            const event = take();
+            if (event) {
                 cleanup();
-                resolve(session.messages.splice(i, 1)[0]);
+                resolve(event);
                 return;
             }
             if (session.closed || session.cancelledReason !== undefined) {
@@ -292,6 +366,7 @@ export function closeSession(requestId: string): void {
     if (session) {
         session.closed = true;
         notifyAll(session);
+        clearExecChannels(session);
         sessions.delete(requestId);
         logger.debug({ requestId }, '[SESSION] closed');
     }

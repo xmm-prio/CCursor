@@ -1,21 +1,31 @@
+import type { HostRole, HostTopology } from './server/config/hostTopology'
+import type { PortStatus } from './server/config/portSelection'
 import { createWriteStream, existsSync, mkdirSync } from 'node:fs'
 import * as http from 'node:http'
 import * as vscode from 'vscode'
 import { bumpRefreshSignal, pushRoutesUpdate, startServer, stopServer } from './server'
 import { getServerConfig } from './server/config'
+import { resolveHostTopology } from './server/config/hostTopology'
 import { getLogsDir, getProvidersFilePath, getSessionLogFilePath } from './server/config/paths'
+import { selectServerPort } from './server/config/portSelection'
+import { buildProviderSetupNotice } from './server/config/providerOnboarding'
 import { ensureProvidersFile, onProvidersChange, startProvidersWatcher, stopProvidersWatcher } from './server/config/providersStore'
-import { ensureRoutesFile, onRoutesChange, startRoutesWatcher, stopRoutesWatcher, toggleByokMode } from './server/config/routesStore'
+import { buildServerUrl, normalizeExternalUrl } from './server/config/routesPayload'
+import { ensureRoutesFile, onRoutesChange, setServerExternalUrl, startRoutesWatcher, stopRoutesWatcher, toggleByokMode } from './server/config/routesStore'
+import { PORT_FALLBACK_SPAN } from './server/data/defaults'
 import { isLikelyWindowsMsvcMissing, preflightSupermarkdown, setSupermarkdownNativeErrorNotifier } from './server/handlers/agent/supermarkdown'
 import { resetProviderInstanceCache } from './server/handlers/llm/providerRuntime'
 import { initLogger } from './server/logger'
 import { getRoutesFilePath } from './server/routes'
 import { PanelProvider } from './ui/panel-provider'
-import { getState, onStateChange, probeByokServer, refreshState, setFileLogState } from './ui/state'
+import { clearEndpointOverride, getEndpoint, getState, onStateChange, probeByokServer, refreshState, setEndpointOverride, setFileLogState } from './ui/state'
 import { startUpdateCheck, stopUpdateCheck } from './update-check'
 
 let outputChannel: vscode.LogOutputChannel
-let statusBarItem: vscode.StatusBarItem
+let statusBarItem: vscode.StatusBarItem | null = null
+
+// 当前进程的拓扑 (control/worker × local/remote) —— 见 hostTopology.ts
+let topology: HostTopology = resolveHostTopology({ role: 'control' })
 
 // 窗口标识 — 从 VSCODE_PROCESS_TITLE 的 [N-M] 提取, 提前声明供 initLogFilePath 读取
 let myWindowId: number | null = null
@@ -113,7 +123,7 @@ function log(level: SseLogLevel, msg: string): void {
 }
 
 function showPortOccupiedMessage(port: number): void {
-  const text = `Cursor++ Server cannot start because port ${port} is already used by another process. Close the process using this port, then restart Cursor.`
+  const text = `Cursor++ Server cannot start: ports ${port}-${port + PORT_FALLBACK_SPAN - 1} are all used by other processes. Free one of them, then restart Cursor.`
   log('error', `[SRV] ${text}`)
   vscode.window.showErrorMessage(text)
 }
@@ -241,12 +251,12 @@ function disconnectLogStream() {
 async function onSseDisconnect() {
   if (getState().server === 'local')
     return // owner 自己关闭,不需要接管
-  const cfg = getServerConfig()
+  const cfg = getEndpoint()
   const probe = await probeByokServer(cfg.host, cfg.port)
   if (probe.kind === 'byok') {
     setTimeout(() => {
       if (myWindowId !== null) {
-        const c = getServerConfig()
+        const c = getEndpoint()
         connectLogStream(c.port, myWindowId)
       }
     }, 3000)
@@ -278,7 +288,7 @@ async function attemptTakeover() {
     renderStatusBar()
     stopHeartbeat()
     if (myWindowId !== null) {
-      const cfg = getServerConfig()
+      const cfg = getEndpoint()
       connectLogStream(cfg.port, myWindowId)
     }
     log('info', '[TAKEOVER] this window is now the server owner')
@@ -288,7 +298,7 @@ async function attemptTakeover() {
     renderStatusBar()
     startHeartbeat()
     if (myWindowId !== null) {
-      const cfg = getServerConfig()
+      const cfg = getEndpoint()
       connectLogStream(cfg.port, myWindowId)
     }
   }
@@ -305,7 +315,7 @@ function startHeartbeat() {
       stopHeartbeat()
       return
     }
-    const cfg = getServerConfig()
+    const cfg = getEndpoint()
     const probe = await probeByokServer(cfg.host, cfg.port)
     if (probe.kind === 'offline') {
       log('info', '[HEARTBEAT] server unreachable, attempting takeover...')
@@ -337,6 +347,8 @@ function stopHeartbeat() {
 // 点击 → toggle BYOK Mode (非 server)。Server 启停走命令面板/侧边栏。
 
 function renderStatusBar() {
+  if (!statusBarItem)
+    return
   const s = getState()
 
   // server 状态前缀 codicon: ✓ on / ✗ offline (close 是 × 不是字母 x)
@@ -371,10 +383,11 @@ async function toggleServer() {
 
   if (s.server === 'local') {
     await stopServer()
+    clearEndpointOverride()
     log('info', '[SRV] stopped')
     vscode.window.showInformationMessage('Cursor++ BYOK Server stopped')
   }
-  else if (s.server === 'remote') {
+  else if (s.server === 'peer') {
     vscode.window.showInformationMessage('Server is running in another Cursor instance')
     return
   }
@@ -384,7 +397,7 @@ async function toggleServer() {
   await refreshState()
 }
 
-async function waitForRemoteByokServer(host: string, port: number, attempts = 8): Promise<boolean> {
+async function waitForPeerByokServer(host: string, port: number, attempts = 8): Promise<boolean> {
   for (let i = 0; i < attempts; i++) {
     const probe = await probeByokServer(host, port)
     if (probe.kind === 'byok')
@@ -396,6 +409,114 @@ async function waitForRemoteByokServer(host: string, port: number, attempts = 8)
   return false
 }
 
+/** Translate the shared server probe into the port-selection vocabulary. */
+async function probePortStatus(host: string, port: number): Promise<PortStatus> {
+  const probe = await probeByokServer(host, port)
+  if (probe.kind === 'offline')
+    return 'free'
+  return probe.kind === 'byok' ? 'byok' : 'occupied'
+}
+
+function isAddrInUse(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err)
+  const code = typeof err === 'object' && err !== null && 'code' in err ? String((err as { code?: unknown }).code) : ''
+  return code === 'EADDRINUSE' || msg.includes('EADDRINUSE')
+}
+
+/** Another Cursor++ instance owns the endpoint: follow it instead of competing. */
+async function runAsPeer(port: number) {
+  log('info', `[SRV] port ${port} claimed by another Cursor++ instance, running as peer`)
+  await refreshState()
+  renderStatusBar()
+  startHeartbeat()
+}
+
+/**
+ * Publish the address a renderer on the user's machine can reach.
+ *
+ * Only relevant when the extension host itself runs remotely (Remote SSH /
+ * WSL / containers): asExternalUri then hands out a forwarded address. On a
+ * local host the topology reports publishesExternalUrl === false, nothing is
+ * queried and the field stays absent, so local behaviour is unchanged.
+ */
+async function publishExternalUrl(host: string, port: number): Promise<void> {
+  const localUrl = buildServerUrl(host, port)
+  let external: string | null = null
+
+  if (topology.publishesExternalUrl) {
+    try {
+      const forwarded = await vscode.env.asExternalUri(vscode.Uri.parse(localUrl))
+      external = normalizeExternalUrl(localUrl, forwarded.toString())
+      log('info', external
+        ? `[SRV] ${topology.label}, renderer-facing URL ${external}`
+        : `[SRV] ${topology.label}, asExternalUri returned the local address, keeping ${localUrl}`)
+    }
+    catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err)
+      log('warn', `[SRV] ${topology.label}, asExternalUri failed (${msg}), keeping ${localUrl}`)
+    }
+  }
+
+  await setServerExternalUrl(external)
+}
+
+/** Guard against ping-ponging through the span when ports keep being stolen. */
+const MAX_LISTEN_ATTEMPTS = 3
+
+/**
+ * Claim a port and listen on it.
+ *
+ * Ordering matters: startServer() persists the chosen host/port into
+ * routes.json before it binds, so the injected consumers — which discover the
+ * endpoint from that file — never observe a listening socket they have no
+ * address for. Once listening, the routes payload is pushed so already
+ * connected consumers pick the new endpoint up without waiting for a watcher.
+ */
+async function startServerWithFallback(host: string, preferredPort: number, attempt = 0): Promise<void> {
+  const selection = await selectServerPort(preferredPort, PORT_FALLBACK_SPAN, port => probePortStatus(host, port))
+  if (!selection) {
+    showPortOccupiedMessage(preferredPort)
+    return
+  }
+  if (selection.shifted)
+    log('warn', `[SRV] port ${preferredPort} is occupied, falling back to ${selection.port}`)
+
+  setEndpointOverride(host, selection.port)
+
+  if (selection.status === 'byok') {
+    await runAsPeer(selection.port)
+    return
+  }
+
+  try {
+    const started = await startServer({ host, port: selection.port })
+    setEndpointOverride(started.host, started.port)
+    log('info', `[SRV] listening at http://${started.host}:${started.port}`)
+    stopHeartbeat()
+    await publishExternalUrl(started.host, started.port)
+    pushRoutesUpdate()
+  }
+  catch (err: unknown) {
+    if (!isAddrInUse(err)) {
+      const msg = err instanceof Error ? err.message : String(err)
+      log('error', `[SRV] failed to start: ${msg}`)
+      vscode.window.showErrorMessage(`Cursor++ Server failed: ${msg}`)
+      return
+    }
+    // Lost the race between probing and binding.
+    if (await waitForPeerByokServer(host, selection.port)) {
+      await runAsPeer(selection.port)
+      return
+    }
+    if (attempt + 1 >= MAX_LISTEN_ATTEMPTS) {
+      showPortOccupiedMessage(selection.port)
+      return
+    }
+    log('warn', `[SRV] port ${selection.port} was taken while binding, retrying from ${selection.port + 1}`)
+    await startServerWithFallback(host, selection.port + 1, attempt + 1)
+  }
+}
+
 async function doStartServer() {
   const cfg = getServerConfig()
 
@@ -405,60 +526,25 @@ async function doStartServer() {
     log('warn', '[SRV] server already running in this instance')
     return
   }
-  if (s.server === 'remote') {
-    log('info', `[SRV] port ${cfg.port} claimed by another Cursor++ instance, running as remote`)
+  if (s.server === 'peer') {
+    log('info', `[SRV] port ${getEndpoint().port} claimed by another Cursor++ instance, running as peer`)
     startHeartbeat()
     return
   }
-  if (s.serverIssue === 'port_occupied') {
-    showPortOccupiedMessage(cfg.port)
-    return
-  }
 
-  try {
-    const { host, port } = await startServer({
-      host: cfg.host,
-      port: cfg.port,
-    })
-    log('info', `[SRV] listening at http://${host}:${port}`)
-    stopHeartbeat()
-  }
-  catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err)
-    const code = typeof err === 'object' && err !== null && 'code' in err ? String((err as { code?: unknown }).code) : ''
-    if (code === 'EADDRINUSE' || msg.includes('EADDRINUSE')) {
-      if (await waitForRemoteByokServer(cfg.host, cfg.port)) {
-        log('info', `[SRV] port ${cfg.port} claimed by another Cursor++ instance, running as remote`)
-        await refreshState()
-        renderStatusBar()
-        startHeartbeat()
-      }
-      else {
-        await refreshState()
-        if (getState().server === 'remote') {
-          log('info', `[SRV] port ${cfg.port} claimed by another Cursor++ instance, running as remote`)
-          startHeartbeat()
-          return
-        }
-        showPortOccupiedMessage(cfg.port)
-      }
-    }
-    else {
-      log('error', `[SRV] failed to start: ${msg}`)
-      vscode.window.showErrorMessage(`Cursor++ Server failed: ${msg}`)
-    }
-  }
+  await startServerWithFallback(cfg.host, cfg.port)
 }
 
 // ── 激活 ──
 
-export async function activate(context: vscode.ExtensionContext) {
-  outputChannel = vscode.window.createOutputChannel('Cursor++', { log: true })
-  initLogger((level, msg) => writeToChannel({ level, msg }))
-  setupSupermarkdownNativeTip()
-  preflightSupermarkdown()
-  log('info', 'Cursor++ activating...')
-
+/**
+ * Status bar, panel and commands — everything backed by a `contributes` entry.
+ *
+ * Only the control identity's manifest declares those contribution points, so
+ * registering them from the headless worker would throw on the webview view
+ * and duplicate every command id inside a Remote SSH window.
+ */
+function registerUserInterface(context: vscode.ExtensionContext): void {
   // 状态栏 (BYOK Mode 切换按钮)
   statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100)
   statusBarItem.command = 'cursor2plus.toggleByok'
@@ -480,13 +566,9 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('cursor2plus.toggleByok', async () => {
       const next = await toggleByokMode()
       await refreshState()
-      // 1. 推送 REST redirect 列表变更到 renderer — inject-patch 的 fetch wrapper
-      //    安装时写死了 _restPaths, 切 OFF 后 /auth/poll 仍被拦截导致登录中断,
-      //    必须通过 SSE 推送新列表让 renderer 热更新。
-      const restPaths = next.redirect
-        .filter((r: string) => r.startsWith('REST:'))
-        .map((r: string) => r.slice(5))
-      pushRoutesUpdate(restPaths)
+      // 1. 下发新的 routes — 消费方安装时只拿到 BASE 白名单, 切 OFF 后
+      //    /auth/poll 仍被拦截会阻断登录, 必须推送让两侧热更新。
+      pushRoutesUpdate()
       // 2. 触发 renderer hook 主动刷新模型列表 (借助捕获的 aiService 引用)
       bumpRefreshSignal()
       const label = next.byokMode ? 'BYOK enabled' : 'BYOK disabled (using official Cursor)'
@@ -504,10 +586,44 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('cursor2plus.toggleFileLog', () => toggleFileLog(context)),
     vscode.commands.registerCommand('cursor2plus.openLogFile', () => openLogFile()),
   )
+}
+
+export function activate(context: vscode.ExtensionContext): Promise<void> {
+  return bootstrap(context, 'control')
+}
+
+/**
+ * Shared activation path of both deployment identities.
+ *
+ * `control` is the `ui` extension the user installs locally; `worker` is the
+ * headless `workspace` companion installed on a remote host so that the
+ * extension hosts living over there (cursor-agent-host and friends) reach a
+ * BYOK server on their own machine. Everything below is identical for the two
+ * except the user interface, which only the control identity contributes.
+ */
+export async function bootstrap(context: vscode.ExtensionContext, role: HostRole): Promise<void> {
+  topology = resolveHostTopology({ role, remoteName: vscode.env.remoteName })
+
+  outputChannel = vscode.window.createOutputChannel(
+    topology.ownsUserInterface ? 'Cursor++' : 'Cursor++ (remote host)',
+    { log: true },
+  )
+  initLogger((level, msg) => writeToChannel({ level, msg }))
+  setupSupermarkdownNativeTip()
+  preflightSupermarkdown()
+  log('info', `Cursor++ activating... (${topology.label})`)
+
+  if (topology.ownsUserInterface)
+    registerUserInterface(context)
 
   // 确保配置文件存在 —— 即使 server 未启动,面板也能读写
   await ensureRoutesFile()
-  await ensureProvidersFile()
+  const providers = await ensureProvidersFile()
+  const setupNotice = buildProviderSetupNotice(topology, providers, getProvidersFilePath())
+  if (setupNotice) {
+    log('warn', `[CFG] ${setupNotice.message} ${setupNotice.detail}`)
+    vscode.window.showWarningMessage(`${setupNotice.message} ${setupNotice.detail}`)
+  }
 
   // 文件监听: 其他实例修改配置时自动同步状态 + UI
   startRoutesWatcher()
@@ -515,6 +631,9 @@ export async function activate(context: vscode.ExtensionContext) {
   const disposeRoutesWatch = onRoutesChange(async () => {
     await refreshState()
     renderStatusBar()
+    // 手动编辑 routes.json 与 toggle 命令走同一条下发通道, 否则消费方的
+    // 白名单停留在上一次推送的版本。
+    pushRoutesUpdate()
     bumpRefreshSignal()
   })
   const disposeProvidersWatch = onProvidersChange(async () => {
@@ -535,7 +654,7 @@ export async function activate(context: vscode.ExtensionContext) {
     await refreshState()
   }
 
-  if (getState().server === 'remote')
+  if (getState().server === 'peer')
     startHeartbeat()
 
   // 解析窗口 ID 并连接 SSE 日志流
@@ -544,7 +663,7 @@ export async function activate(context: vscode.ExtensionContext) {
   initLogFilePath(context)
   setFileLogState(fileLogEnabled, logFilePath)
   if (myWindowId !== null) {
-    const cfg = getServerConfig()
+    const cfg = getEndpoint()
     log('info', `[SRV] windowId=${myWindowId}, connecting to :${cfg.port}`)
     connectLogStream(cfg.port, myWindowId)
   }
@@ -555,10 +674,11 @@ export async function activate(context: vscode.ExtensionContext) {
   if (fileLogEnabled)
     log('info', `[SRV] file logging restored from globalState → ${logFilePath}`)
 
-  log('info', 'Cursor++ activated')
+  log('info', `Cursor++ activated (${topology.label})`)
 
-  // 版本更新检查
-  startUpdateCheck(context.globalState, msg => log('info', msg))
+  // 版本更新检查 — 只有带 UI 的一侧能把结果呈现给用户
+  if (topology.ownsUserInterface)
+    startUpdateCheck(context.globalState, msg => log('info', msg))
 }
 
 export async function deactivate() {
@@ -569,6 +689,8 @@ export async function deactivate() {
   stopRoutesWatcher()
   stopProvidersWatcher()
   await stopServer()
+  clearEndpointOverride()
+  statusBarItem = null
   if (outputChannel)
     outputChannel.dispose()
 }

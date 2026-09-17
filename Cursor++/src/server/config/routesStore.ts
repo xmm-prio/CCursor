@@ -27,12 +27,16 @@ function withFallback(loaded: Partial<RoutesConfig> | null): RoutesConfig {
   if (!loaded)
     return fallback
   const byokMode = normalizeByokMode(loaded.byokMode)
+  const externalUrl = typeof loaded.server?.externalUrl === 'string' && loaded.server.externalUrl
+    ? loaded.server.externalUrl
+    : undefined
   return {
     $schemaVersion: loaded.$schemaVersion ?? fallback.$schemaVersion,
     byokMode,
     server: {
       host: loaded.server?.host ?? fallback.server.host,
       port: loaded.server?.port ?? fallback.server.port,
+      ...(externalUrl ? { externalUrl } : {}),
     },
     collector: {
       host: loaded.collector?.host ?? fallback.collector.host,
@@ -86,6 +90,26 @@ export function setServerHost(host: string): Promise<RoutesConfig> {
 export function setServerPort(port: number): Promise<RoutesConfig> {
   return updateRoutes((draft) => {
     draft.server.port = port
+  })
+}
+
+/**
+ * Publish (or clear) the forwarded address of a remote extension host.
+ *
+ * Writing an unchanged value is skipped so the routes.json watchers of every
+ * other instance are not woken up on each server start.
+ */
+export async function setServerExternalUrl(externalUrl: string | null): Promise<RoutesConfig> {
+  const current = loadRoutes()
+  const next = externalUrl ?? undefined
+  if (current.server.externalUrl === next)
+    return current
+  return updateRoutes((draft) => {
+    if (next)
+      draft.server.externalUrl = next
+    else
+      delete draft.server.externalUrl
+    logger.info({ externalUrl: next ?? null }, '[CFG] server.externalUrl updated')
   })
 }
 

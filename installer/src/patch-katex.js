@@ -42,7 +42,7 @@ export function patchKatex(paths, log) {
     return false;
   }
 
-  const htmlPath = `${paths.appRoot}/out/vs/code/electron-sandbox/workbench/workbench.html`;
+  const htmlPath = paths.workbenchHtml;
   if (!existsSync(htmlPath)) {
     log?.('[katex] WARNING: workbench.html not found, skipping');
     return false;

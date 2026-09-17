@@ -27,6 +27,34 @@ function buildOutputTruncation(combined: string): { outputHead: string; outputTa
     };
 }
 
+/**
+ * Ways a shell exec stream can end without a terminal event.
+ *
+ * `exit` / `backgrounded` / `rejected` / `permissionDenied` are the protocol's terminal
+ * events. Anything else that ends the stream leaves the exit status unknown, and must be
+ * reported as an error rather than as exitCode=0 success.
+ */
+export const SHELL_STREAM_FAILURE_REASONS = {
+    streamClosedBeforeExit: 'the client closed the exec stream before reporting an exit status',
+    streamEndedWithoutExit: 'the exec stream ended (transport closed or wait timed out) before reporting an exit status',
+} as const;
+
+export type ShellStreamFailureReason = keyof typeof SHELL_STREAM_FAILURE_REASONS;
+
+/** Error text of an aborted stream, carrying whatever output was collected before the abort. */
+function buildStreamFailureError(reason: ShellStreamFailureReason, stdout: string, stderr: string): string {
+    const combined = `${stdout}${stderr}`;
+    const truncation = buildOutputTruncation(combined);
+    const collected = truncation
+        ? `${truncation.outputHead}\n... [${truncation.elidedChars} chars elided] ...\n${truncation.outputTail}`
+        : combined;
+    const head = `Shell stream aborted: ${SHELL_STREAM_FAILURE_REASONS[reason]}.`
+        + ' The command may still be running; its exit status is unknown.';
+    return collected.trim().length > 0
+        ? `${head}\n\nOutput collected before the abort:\n\n${collected}`
+        : `${head}\n\nNo output was collected before the abort.`;
+}
+
 export function buildShellToolResult(
     input: Record<string, unknown>,
     state: {
@@ -50,6 +78,11 @@ export function buildShellToolResult(
             reason?: number;
             terminalsFolder?: string;
         };
+        /**
+         * The stream ended without any terminal event (no exit / backgrounded / rejected /
+         * permissionDenied). `reason` says which way it ended; see buildStreamFailureError.
+         */
+        streamFailure?: { reason: ShellStreamFailureReason };
     },
 ): ToolResultEnvelope {
     if (state.rejected) {
@@ -90,6 +123,19 @@ export function buildShellToolResult(
                     command: state.permissionDenied.command ?? str(input.command),
                     workingDirectory: state.permissionDenied.workingDirectory ?? str(input.workingDirectory ?? input.cwd),
                     error: state.permissionDenied.error ?? 'permission denied',
+                },
+            },
+        };
+    }
+
+    if (state.streamFailure) {
+        return {
+            result: {
+                case: 'spawnError',
+                value: {
+                    command: str(input.command),
+                    workingDirectory: str(state.cwd ?? input.workingDirectory ?? input.cwd),
+                    error: buildStreamFailureError(state.streamFailure.reason, state.stdout, state.stderr),
                 },
             },
         };
@@ -255,6 +301,12 @@ export function buildShellToolResultText(
     }
     if (resultCaseName === 'permissionDenied') {
         return `Shell permission denied: ${str(value.error, 'permission denied')}`;
+    }
+    // spawnError carries a free-form error string — the client's own spawn failures as
+    // well as our aborted-stream reports (buildStreamFailureError). Render it verbatim
+    // instead of dumping the raw JSON envelope.
+    if (resultCaseName === 'spawnError') {
+        return str(value.error, 'Shell failed to start');
     }
     if (resultCaseName === 'rejected') {
         return `Shell rejected: ${str(value.reason, 'rejected')}`;

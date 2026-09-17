@@ -15,7 +15,18 @@ import { getByokMode } from '../server/config/routesStore'
 
 import { getWebTools } from '../server/config/searchConfigStore'
 
-export type ServerState = 'local' | 'remote' | 'offline'
+/**
+ * Where the BYOK server this window talks to lives.
+ *
+ * - `local`   — owned by this window
+ * - `peer`    — another Cursor++ instance already owns the endpoint
+ * - `offline` — nobody is listening
+ *
+ * `peer` used to be called `remote`, which collided with VS Code's Remote SSH
+ * notion of remote (see server.externalUrl). The two are unrelated: a peer is
+ * always another process on the same machine.
+ */
+export type ServerState = 'local' | 'peer' | 'offline'
 
 export type ServerIssue = 'port_occupied' | null
 
@@ -48,6 +59,30 @@ let current: AppState = {
   webTools: { $schemaVersion: 1, search: { providers: [], parallel: false, maxResults: 5 }, fetch: { provider: 'builtin' } },
   fileLogEnabled: false,
   logFilePath: '',
+}
+
+/**
+ * Effective endpoint — the settings value unless the port fallback moved us.
+ *
+ * Everything that probes or connects (state refresh, heartbeat, log stream)
+ * has to follow the port the server actually claimed, not the preferred one
+ * from the settings.
+ */
+let endpointOverride: { host: string, port: number } | null = null
+
+export function setEndpointOverride(host: string, port: number): void {
+  endpointOverride = { host, port }
+}
+
+export function clearEndpointOverride(): void {
+  endpointOverride = null
+}
+
+export function getEndpoint(): { host: string, port: number } {
+  if (endpointOverride)
+    return endpointOverride
+  const cfg = getServerConfig()
+  return { host: cfg.host, port: cfg.port }
 }
 
 /** 文件日志状态由 extension.ts 注入 (globalState + 实际写入 stream) */
@@ -112,7 +147,7 @@ export async function probeByokServer(host: string, port: number): Promise<Serve
 }
 
 export async function refreshState(_secrets?: vscode.SecretStorage): Promise<AppState> {
-  const cfg = getServerConfig()
+  const cfg = getEndpoint()
 
   let server: ServerState = 'offline'
   let serverIssue: ServerIssue = null
@@ -123,7 +158,7 @@ export async function refreshState(_secrets?: vscode.SecretStorage): Promise<App
   else {
     const probe = await probeByokServer(cfg.host, cfg.port)
     if (probe.kind === 'byok') {
-      server = 'remote'
+      server = 'peer'
     }
     else if (probe.kind === 'occupied') {
       serverIssue = 'port_occupied'

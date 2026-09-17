@@ -260,6 +260,7 @@ export const SwitchModeTool: ToolRegistryEntry = {
     aliases: ["SwitchMode"],
     cursorToolType: 'switchModeToolCall',
     execArgsType: null,
+    conciseStaticContext: 'Switch between available modes. Proactively consider switching modes for relevant requests.',
     llmToolByProvider: {
         anthropic: ANTHROPIC,
         openai: OPENAI,
@@ -270,4 +271,9 @@ export const SwitchModeTool: ToolRegistryEntry = {
         ...(typeof input.explanation === 'string' ? { explanation: input.explanation } : {}),
         toolCallId: callId,
     }),
+    interaction: {
+        queryCase: 'switchModeRequestQuery',
+        responseCase: 'switchModeRequestResponse',
+        buildQueryValue: (startedArgs, callId) => ({ args: startedArgs, toolCallId: callId }),
+    },
 };

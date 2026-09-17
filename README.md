@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <a href="https://www.npmjs.com/package/@cometix/ccursor"><img src="https://img.shields.io/npm/v/@cometix/ccursor" alt="npm" /></a>
+  <strong>Customized fork</strong> of <a href="https://github.com/CometixSpace/CCursor">CometixSpace/CCursor</a> — installed directly from this repository
 </p>
 
 ---
@@ -22,22 +22,43 @@
 
 Cursor++ lets you use **your own LLM API keys** (Anthropic, OpenAI, Google Gemini, or any OpenAI-compatible provider) with [Cursor IDE](https://cursor.com), bypassing the official subscription. It runs a local BYOK server inside Cursor's extension host, intercepts ConnectRPC/REST traffic, and routes LLM requests to your configured providers.
 
+This fork carries source code and prebuilt artifacts, so it installs straight from git with no toolchain required.
+
 ---
 
 ## Quick Start
 
+Install directly from this repository — no npm publish involved:
+
 ```bash
 # Install
-npx @cometix/ccursor install
+npx github:xmm-prio/CCursor install
 
 # Restart Cursor, then open the Cursor++ sidebar panel to configure providers
 
 # Uninstall
-npx @cometix/ccursor uninstall
+npx github:xmm-prio/CCursor uninstall
 
 # Check installation status
-npx @cometix/ccursor status
+npx github:xmm-prio/CCursor status
 ```
+
+`npx` caches the clone. To pick up a newer commit, pin a ref or clear the cache:
+
+```bash
+# Pin a branch, tag, or commit
+npx github:xmm-prio/CCursor#main install
+
+# Full git URL works too
+npx git+https://github.com/xmm-prio/CCursor.git install
+```
+
+Requires **Node.js >= 18**. Nothing else — the CLI bundle and the packaged
+extension are committed to this repository, so no build step runs on your machine.
+
+> Upgrading from a previous install? Run `uninstall` before `install`. The
+> injected router carries a version marker, and stacking a new install on top of
+> old patches will not take effect.
 
 ---
 
@@ -50,8 +71,8 @@ npx @cometix/ccursor status
 - **Error Banner** — LLM errors surface as Cursor's native retry banner with retryable/non-retryable classification
 - **Per-Window Logging** — Each window gets its own log stream, colored output in LogOutputChannel
 - **Hot-Reload** — Config changes take effect without restarting Cursor
-- **22 Agent Tools** — Shell, Read, Grep, Glob, StrReplace, Write, Task, MCP, etc.
-- **Hub Integration** — Device authorization via LinuxDO Connect
+- **Native Agent Tools** — Shell, Read, Grep, Glob, Edit, Write, Task, MCP, plus the `cursor` dynamic namespace (ConnectScm, SearchConversations, SetActiveBranch, CreateGoal, UpdateGoal, WriteShellStdin)
+- **Remote SSH** — A headless companion extension serves the remote host while the local side keeps the UI
 
 ---
 
@@ -66,7 +87,7 @@ Cursor IDE
   ├─ always-local-patch (extension host)
   │   └─ rewrite http/https.request + hot-reload from routes.json
   │
-  └─ Cursor++ Extension (BYOK Server @ 127.0.0.1:9960)
+  └─ Cursor++ Extension (BYOK Server @ 127.0.0.1:39831)
       ├─ Fastify + ConnectRPC (27 services)
       ├─ LLM: Anthropic / OpenAI / Gemini SDK
       ├─ Agent: multi-round tool-calling orchestrator
@@ -138,15 +159,52 @@ Requires **Cursor IDE** + **Node.js >= 18**.
 
 ---
 
-## Issues & Feedback
+## Remote SSH
 
-This repository is for **issue tracking and documentation only** — source code is not published.
+Under Remote SSH the Cursor agent host runs on the **remote** machine, so the
+remote side needs its own BYOK server. Three steps, in order:
 
-- [Submit an Issue](https://github.com/CometixSpace/CCursor/issues)
-- [LinuxDO Discussion](https://linux.do/t/topic/1926833)
+```bash
+# 1. On the remote host — patch the Cursor server install
+npx github:xmm-prio/CCursor install   # targets ~/.cursor-server/bin/<commit>
+
+# 2. On the remote host — provide keys (they are never copied across machines)
+vi ~/.ccursor/providers.json
+```
+
+3. Build the companion extension and install it into the remote window via
+   **Extensions → Install from VSIX → Install in SSH: \<host\>**:
+
+```bash
+cd Cursor++ && pnpm run vsix:remote   # produces cursor2plus-remote-<ver>.vsix
+```
+
+The local `cursor2plus` extension keeps the UI; the remote `cursor2plus-remote`
+companion is headless and contributes no commands, so the two never collide.
+
+> `~/.cursor-server/bin/<commit>` is recreated whenever Cursor upgrades, so the
+> remote patch is **not** one-time — rerun `install` on the remote after each
+> client upgrade.
 
 ---
 
-<p align="center">
-  <a href="https://ccursor.cometix.dev">Hub</a> · <a href="https://www.npmjs.com/package/@cometix/ccursor">npm</a>
-</p>
+## Building from Source
+
+Prebuilt artifacts are committed, so this is only needed when you change the code:
+
+```bash
+cd Cursor++  && pnpm install
+cd ../installer && npm install && npm run build:all
+```
+
+`build:all` packages the extension into `installer/vsix/` and bundles the CLI
+into `installer/dist/`. Both directories are tracked — commit them so that
+`npx github:xmm-prio/CCursor` keeps working.
+
+---
+
+## Credits & License
+
+Fork of [CometixSpace/CCursor](https://github.com/CometixSpace/CCursor), licensed
+under **AGPL-3.0-or-later**. Upstream discussion:
+[LinuxDO](https://linux.do/t/topic/1926833).

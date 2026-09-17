@@ -22,11 +22,14 @@ import {
   AgentServerMessageSchema,
   AskQuestionToolCallSchema,
   AwaitToolCallSchema,
+  ConnectScmToolCallSchema,
   ConversationStateStructureSchema,
+  CreateGoalToolCallSchema,
   CreatePlanToolCallSchema,
   DeleteToolCallSchema,
   EditToolCallDeltaSchema,
   EditToolCallSchema,
+  ExecServerControlMessageSchema,
   ExecServerMessageSchema,
   FetchToolCallSchema,
   GenerateImageToolCallSchema,
@@ -38,13 +41,16 @@ import {
   KvServerMessageSchema,
   ListMcpResourcesToolCallSchema,
   LsToolCallSchema,
+  McpAuthToolCallSchema,
   McpToolCallSchema,
   PartialToolCallUpdateSchema,
   ReadLintsToolCallSchema,
   ReadMcpResourceToolCallSchema,
   ReadToolCallSchema,
   ReadTodosToolCallSchema,
+  SearchConversationsToolCallSchema,
   SemSearchToolCallSchema,
+  SetActiveBranchToolCallSchema,
   ShellToolCallDeltaSchema,
   ShellToolCallSchema,
   SwitchModeToolCallSchema,
@@ -59,9 +65,11 @@ import {
   UserMessageAppendedUpdateSchema,
   UserMessageSchema,
   SimulatedMsgReason,
+  UpdateGoalToolCallSchema,
   UpdateTodosToolCallSchema,
   WebFetchToolCallSchema,
   WebSearchToolCallSchema,
+  WriteShellStdinToolCallSchema,
   CommunicateUpdateToolCallSchema,
 } from '../../gen/agent_v1_pb'
 import { logger, streamLogger } from '../../logger'
@@ -148,6 +156,13 @@ const TOOL_CALL_SCHEMAS: Record<string, GenMessage<any>> = {
   fetchToolCall: FetchToolCallSchema,
   lsToolCall: LsToolCallSchema,
   communicateUpdateToolCall: CommunicateUpdateToolCallSchema,
+  connectScmToolCall: ConnectScmToolCallSchema,
+  mcpAuthToolCall: McpAuthToolCallSchema,
+  searchConversationsToolCall: SearchConversationsToolCallSchema,
+  setActiveBranchToolCall: SetActiveBranchToolCallSchema,
+  createGoalToolCall: CreateGoalToolCallSchema,
+  updateGoalToolCall: UpdateGoalToolCallSchema,
+  writeShellStdinToolCall: WriteShellStdinToolCallSchema,
 }
 
 const TOOL_CALL_DELTA_SCHEMAS: Record<string, GenMessage<any>> = {
@@ -171,6 +186,17 @@ function iu(msg: Record<string, unknown>): AgentServerMessage {
 /** 构造 heartbeat 帧 */
 export function heartbeat(): AgentServerMessage {
   return iu({ case: 'heartbeat', value: {} })
+}
+
+/**
+ * 构造一条由工具附带产出的 interactionUpdate 帧。
+ *
+ * 少数工具的客户端效果不在 toolCall 本身,而在一条独立的 update 上
+ * (如 SetActiveBranch 的 activeBranchChange)。工具在 registry 里声明
+ * buildLocalUpdates,由 toolRuntime 统一经这里发出。
+ */
+export function toolLocalUpdate(updateCase: string, value: Record<string, unknown>): AgentServerMessage {
+  return iu({ case: updateCase, value })
 }
 
 /** 构造 thinkingDelta 帧 */
@@ -440,6 +466,27 @@ export function execMessage(id: number, execId: string, argsType: string, args: 
           case: argsType as any,
           value: args,
         } as any,
+      }),
+    },
+  })
+}
+
+/**
+ * 构造 execServerControlMessage.abort 帧 — 要求 Client 终止一个在途 exec。
+ *
+ * This is the only exec-termination capability the protocol gives the server
+ * (agent.v1.ExecServerControlMessage has a single `abort { id }` case). The server never
+ * owns the process; aborting means telling the executor to stop the exec it is running.
+ */
+export function execAbort(execMessageId: number): AgentServerMessage {
+  return create(AgentServerMessageSchema, {
+    message: {
+      case: 'execServerControlMessage',
+      value: create(ExecServerControlMessageSchema, {
+        message: {
+          case: 'abort',
+          value: { id: execMessageId },
+        },
       }),
     },
   })

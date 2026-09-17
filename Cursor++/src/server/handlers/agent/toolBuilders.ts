@@ -40,7 +40,6 @@ export function buildToolArgs(
 
 export type { ToolResultEnvelope } from './toolResults';
 export {
-    buildAskQuestionResultFromInteractionResponse,
     buildExecToolResult,
     buildLocalToolResult,
     buildShellToolResult,

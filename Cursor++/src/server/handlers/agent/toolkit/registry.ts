@@ -29,6 +29,13 @@ import { GetDynamicToolsTool } from './definitions/GetDynamicTools';
 import { ApplyPatchTool } from './definitions/ApplyPatch';
 import { CreatePlanTool } from './definitions/CreatePlan';
 import { UpdateCurrentStepTool } from './definitions/UpdateCurrentStep';
+import { ConnectScmTool } from './definitions/ConnectScm';
+import { CreateGoalTool } from './definitions/CreateGoal';
+import { UpdateGoalTool } from './definitions/UpdateGoal';
+import { SearchConversationsTool } from './definitions/SearchConversations';
+import { SetActiveBranchTool } from './definitions/SetActiveBranch';
+import { McpAuthTool } from './definitions/McpAuth';
+import { WriteShellStdinTool } from './definitions/WriteShellStdin';
 // SemanticSearch 暂不注册 — BYOK server 无 retrieval 后端,
 // 下发给 LLM 只会产生无意义的工具调用。待实现 retrieval 服务后恢复。
 // import { SemanticSearchTool } from './definitions/SemanticSearch';
@@ -59,6 +66,15 @@ const TOOL_REGISTRY: ToolRegistryEntry[] = [
     CallMcpToolTool,
     GetDynamicToolsTool,
     CreatePlanTool,
+    WriteShellStdinTool,
+    SearchConversationsTool,
+    ConnectScmTool,
+    SetActiveBranchTool,
+    CreateGoalTool,
+    UpdateGoalTool,
+    // McpAuth 没有 LLM 侧名字 —— 它经 CallDynamicTool(<mcp server>, 'mcp_auth') 进入,
+    // 注册在这里只为提供协议身份 (tool type / started args / interaction 通道)。
+    McpAuthTool,
     // SemanticSearchTool,
 ];
 

@@ -4,25 +4,18 @@
  * 顺序：
  *   0. 定位 Cursor 安装目录 + 预检
  *   1. 释放默认配置到 ~/.ccursor/
- *   2. 安装扩展到 extensions/cursor2plus/
- *   3. 注入 renderer hook (workbench.js)
- *   4. 注入 always-local 拦截 + 签名绕过 + 优先加载 (extensionHostProcess.js)
- *   5. 注入 cursor-agent-host 独立 HTTP/1.1 transport 拦截并禁用 WebSocket
- *   6. Cursor 3.9+ always-local singleton BYOK router + HTTP/1.1 proxy 修补
- *   7. KaTeX CSS link 修补 (workbench.html)
- *   8. 提示重启
+ *   2. 遍历 profile 声明的补丁目标 (见 steps.js)
+ *   3. 提示重启
+ *
+ * 目标集由安装形态决定，不在这里分支：桌面安装会走完 extension / renderer
+ * hook / always-local / sig bypass / agent-host / utility-process / katex，
+ * 而 ~/.cursor-server/bin/<commit> 这种 server root 只声明 agent-host 与 sig
+ * bypass，其余目标在 profile 里就已经被判为不适用。
  */
-import { existsSync, readFileSync } from 'fs';
-import { findCursorPathsDetailed, formatDiagnostic } from './detect.js';
-import { installExtension, isExtensionInstalled } from './extension-embed.js';
+import { findCursorPathsDetailed, formatDiagnostic, formatInstallSelection, formatRemoteHostNotice } from './detect.js';
 import { hasBackup } from './backup.js';
-import { isInjectPatched, patchInject } from './patch-inject.js';
-import { inspectAlwaysLocalPatch, patchAlwaysLocal } from './patch-always-local.js';
-import { getAgentHostBackupTargets, isAgentHostPatched, patchAgentHost } from './patch-agent-host.js';
-import { patchKatex } from './patch-katex.js';
-import { patchProxy39, needsProxy39Patch, isProxy39Patched } from './patch-proxy-39.js';
-// delete-fix 已移除 — 3.2.11 原生 tombstoneDeletedComposer 已覆盖
 import { releaseDefaults } from './release-defaults.js';
+import { resolveSteps } from './steps.js';
 
 const ok = msg => console.log(`\x1b[32m[OK]\x1b[0m ${msg}`);
 const info = msg => console.log(`\x1b[34m[>]\x1b[0m ${msg}`);
@@ -43,26 +36,26 @@ export async function install() {
     throw new Error('Cursor installation not found');
   }
   info(`Cursor: ${paths.appRoot}`);
-  info(`Version: ${paths.cursorVersion}${paths.hasGlass ? ' (glass)' : ''}`);
+  info(`Version: ${paths.cursorVersion} (${paths.kindLabel}${paths.hasGlass ? ', glass' : ''})`);
+  for (const line of formatInstallSelection(diagnostic)) warn(line);
 
-  const extInstalled = isExtensionInstalled(paths);
-  const desktopPatched = existsSync(paths.workbenchJs) && isInjectPatched(readFileSync(paths.workbenchJs, 'utf-8'));
-  const glassPatched = !existsSync(paths.glassJs) || isInjectPatched(readFileSync(paths.glassJs, 'utf-8'));
-  const hookInjected = desktopPatched && glassPatched;
-  const alPatched = inspectAlwaysLocalPatch(paths).fullyPatched;
-  const agentHostPatched = isAgentHostPatched(paths);
-  const proxy39Ok = !needsProxy39Patch(paths) || isProxy39Patched(paths);
-  const agentHostBackups = getAgentHostBackupTargets(paths).some(file => hasBackup(file, 'agent-host'));
-  const hasBackups = hasBackup(paths.workbenchJs) || hasBackup(paths.glassJs) || hasBackup(paths.alwaysLocalMain)
-    || hasBackup(paths.alwaysLocalSingletonJs) || hasBackup(paths.extensionHostJs) || agentHostBackups;
+  const steps = resolveSteps(paths);
+  const pending = steps.filter(step => step.applicable && !step.inspect(paths).ok);
 
-  if (extInstalled && hookInjected && alPatched && agentHostPatched && proxy39Ok) {
+  if (pending.length === 0) {
     ok('Already fully installed');
     info('To reinstall, run "ccursor uninstall" first');
     return;
   }
 
-  if (hasBackups && !extInstalled) {
+  // Leftover backups while the extension itself is gone means a previous
+  // installation was torn down by hand; re-patching on top of that would
+  // stack a second generation of backups.
+  const extensionStep = steps.find(step => step.id === 'extension');
+  const extensionMissing = extensionStep.applicable && !extensionStep.inspect(paths).ok;
+  const hasBackups = steps.some(step =>
+    step.backupTargets(paths).some(file => hasBackup(file, step.tag)));
+  if (hasBackups && extensionMissing) {
     warn('Found backup files from a previous installation');
     warn('Run "ccursor uninstall" to clean up before reinstalling');
     return;
@@ -73,26 +66,18 @@ export async function install() {
   // 1. 释放默认配置到 ~/.ccursor/ (尊重已有用户文件)
   releaseDefaults(info);
 
-  // 2. 安装扩展
-  installExtension(paths, info);
-
-  // 3. Inject renderer hook
-  patchInject(paths, info);
-
-  // 4. Always-local + sig bypass
-  patchAlwaysLocal(paths, info);
-
-  // 5. Independent Agent Host transport (3.13+)
-  patchAgentHost(paths, info);
-
-  // 6. Cursor 3.9+ always-local singleton BYOK router + HTTP/1.1 proxy sync
-  patchProxy39(paths, info);
-
-  // 7. KaTeX CSS link (workbench.html + checksum)
-  patchKatex(paths, info);
+  // 2. 按注册顺序遍历补丁目标
+  for (const step of steps) {
+    if (!step.applicable) {
+      info(`[${step.id}] Skipped — ${step.skipNote}`);
+      continue;
+    }
+    step.install(paths, info);
+  }
 
   console.log('');
   ok('Installation complete!');
   warn('Restart Cursor for changes to take effect.');
+  for (const line of formatRemoteHostNotice(paths)) warn(line);
   info('Uninstall: npx @cometix/ccursor uninstall');
 }

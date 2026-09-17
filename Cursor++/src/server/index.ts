@@ -9,6 +9,7 @@ import cors from '@fastify/cors'
  */
 import Fastify from 'fastify'
 import { ensureProvidersFile } from './config/providersStore'
+import { buildRoutesPayload, serializeRoutesFrames } from './config/routesPayload'
 import { ensureRoutesFile, loadRoutes, toggleByokMode } from './config/routesStore'
 import { closeAgentDatabase, initDatabase } from './database/sqlite'
 import { enterWindowContext, logger, setLogBroadcast, setLogPush, setLogSubscriberCheck } from './logger'
@@ -126,27 +127,44 @@ export function bumpRefreshSignal(): void {
 }
 
 /**
- * 向所有 renderer SSE 推送 REST redirect 列表变更。
+ * Routes delivery channel — one projection, one broadcast, three consumers.
  *
- * inject-patch 的 globalThis.fetch wrapper 里 _restPaths / _restSet 是安装时写死的,
- * 不随 routes.json 运行时变化。toggle BYOK 后需要通过 SSE 推送新列表让 renderer
- * 热更新,否则 OFF 模式下 /auth/poll 仍被拦截到本地,阻断真实登录流程。
+ * The renderer hook, the node HTTP/1.1 routers and any peer instance all need
+ * the same two facts: where the server listens (host / port / forwarded URL)
+ * and which requests belong to it (REST paths + ConnectRPC services/methods).
+ * Every source of change (BYOK toggle, routes.json edit, port fallback,
+ * external URL publication) funnels into pushRoutesUpdate(), which re-reads
+ * routes.json and broadcasts the projection built by buildRoutesPayload().
  *
- * inject-patch 端监听 `event: routes`, 收到后替换 _restPaths + _restSet。
+ * Wire compatibility: serializeRoutesFrames() emits the legacy `routes` frame
+ * next to `routes-v2`, so hooks injected by an older installer keep working.
  */
-export function pushRoutesUpdate(restPaths: string[]): void {
+function currentRoutesFrames(): string {
+  return serializeRoutesFrames(buildRoutesPayload(loadRoutes()))
+}
+
+export function pushRoutesUpdate(): void {
+  const payload = buildRoutesPayload(loadRoutes())
+  const frames = serializeRoutesFrames(payload)
   let sent = 0
-  const data = JSON.stringify(restPaths)
   for (const reply of refreshEventStreams) {
     try {
-      reply.raw.write(`event: routes\ndata: ${data}\n\n`)
+      reply.raw.write(frames)
       sent++
     }
     catch {
       refreshEventStreams.delete(reply)
     }
   }
-  logger.info({ connections: sent, restPaths: restPaths.length }, '[SRV] routes update pushed')
+  logger.info(
+    {
+      connections: sent,
+      endpoint: payload.server.externalUrl ?? payload.server.url,
+      rest: payload.rest.length,
+      connectRpc: payload.services.length + payload.methods.length,
+    },
+    '[SRV] routes update pushed',
+  )
 }
 
 export interface StartServerOptions extends RuntimeConfigInit {}
@@ -270,10 +288,9 @@ export async function startServer(opts: StartServerOptions): Promise<{ host: str
     refreshEventStreams.add(reply)
     reply.raw.writeHead(200, sseHeaders)
     reply.raw.write(`: connected\n\n`)
-    // 立即推送当前 REST redirect 列表 — inject-patch 初始只含 BASE,
-    // 需要 server 就绪后推送完整列表才能拦截 BYOK 路径
-    const currentRestPaths = loadRoutes().redirect.filter((r: string) => r.startsWith('REST:')).map((r: string) => r.slice(5))
-    reply.raw.write(`event: routes\ndata: ${JSON.stringify(currentRestPaths)}\n\n`)
+    // 立即下发当前 routes — 消费方 (renderer hook / node router) 初始只含 BASE,
+    // 这一帧同时解除 renderer 的启动期就绪门控
+    reply.raw.write(currentRoutesFrames())
     reply.hijack()
 
     req.raw.on('close', () => {
@@ -284,10 +301,7 @@ export async function startServer(opts: StartServerOptions): Promise<{ host: str
   // BYOK toggle — renderer (glass sidebar) 通过 fetch 调用
   server.post('/byok/toggle', async () => {
     const next = await toggleByokMode()
-    const restPaths = next.redirect
-      .filter((r: string) => r.startsWith('REST:'))
-      .map((r: string) => r.slice(5))
-    pushRoutesUpdate(restPaths)
+    pushRoutesUpdate()
     bumpRefreshSignal()
     logger.info({ byokMode: next.byokMode }, '[SRV] BYOK toggled via REST')
     return { byokMode: next.byokMode }

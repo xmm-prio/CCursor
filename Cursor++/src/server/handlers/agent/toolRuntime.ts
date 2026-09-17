@@ -11,18 +11,20 @@ import {
     validateDynamicToolsQuery,
     type CursorDynamicToolDefinition,
 } from './dynamicTools';
+import { clampBlockUntilMs, finalizeShellAwaitTool } from './awaitRuntime';
 import { finalizeEditToolCall } from './editRuntime';
 import { finalizeExecTool } from './execRuntime';
 import { fetchMcpState, mergeMcpStateIntoRoutingTable, type McpRoutingEntry, type McpStateServerInfo } from './mcpState';
 import { finalizeInteractionTool } from './interactionRuntime';
-import { execMessage, toolCallCompleted, toolCallStarted } from './stream';
+import { execMessage, toolCallCompleted, toolCallStarted, toolLocalUpdate } from './stream';
 import { buildToolArgs } from './toolBuilders';
 import {
-    buildAskQuestionResultFromInteractionResponse,
+    buildInteractionResponseToolResult,
     buildLocalToolResult,
     buildWebFetchApprovalResultFromInteractionResponse,
     buildWebSearchApprovalResultFromInteractionResponse,
 } from './toolResults';
+import { findToolByAlias } from './toolRegistry';
 import { finalizeToolCall } from './toolLifecycle';
 import { buildEditPlan, buildExecArgs, mapToolToExecArgs, resolveToolCall, type AvailableDynamicBuiltinTool, type AvailableMcpTool, type ToolCallInfo } from './tools';
 import { getBackgroundJob, registerBackgroundJob, type AgentSession } from './session';
@@ -248,11 +250,7 @@ async function* runToolCallInner(params: Parameters<typeof runToolCall>[0]): Asy
     if (cursorToolType === 'awaitToolCall' && params.session) {
         const taskId = str(sanitizedInput.task_id ?? sanitizedInput.taskId);
         const job = taskId ? getBackgroundJob(params.session, taskId) : undefined;
-        const blockUntilMs = typeof sanitizedInput.block_until_ms === 'number'
-            ? sanitizedInput.block_until_ms
-            : typeof sanitizedInput.blockUntilMs === 'number'
-                ? sanitizedInput.blockUntilMs
-                : 30000;
+        const blockUntilMs = clampBlockUntilMs(sanitizedInput.block_until_ms ?? sanitizedInput.blockUntilMs);
 
         if (job?.kind === 'subagent') {
             // subagent: 走专用 subagentAwaitArgs 通道。
@@ -281,29 +279,30 @@ async function* runToolCallInner(params: Parameters<typeof runToolCall>[0]): Asy
 
         // shell job (或未登记的 task_id, 保守按 shell 终端文件处理): readArgs 读终端文件。
         // 路径: {terminalsFolder}/{shellId}.txt。terminalsFolder 取注册表登记值或 session 兜底。
+        // 单次读会返回一份立刻过时的快照,因此交给 awaitRuntime 在 block_until_ms 预算内
+        // 有界轮询,直到终态 footer 出现 / pattern 命中 / 预算耗尽。
         const terminalsFolder = job?.terminalsFolder ?? params.session.terminalsFolder;
         const shellId = job?.shellId !== undefined ? String(job.shellId) : taskId;
         const path = terminalsFolder && shellId
             ? `${terminalsFolder}/${shellId}.txt`
             : str(sanitizedInput.path ?? taskId);
-        const args: Record<string, unknown> = {
-            path,
-            toolCallId: tc.callId,
-            ...(typeof sanitizedInput.offset === 'number' ? { offset: sanitizedInput.offset } : {}),
-            ...(typeof sanitizedInput.limit === 'number' ? { limit: sanitizedInput.limit } : {}),
-        };
-        const execId = `${tc.callId}-exec`;
-        const execMessageId = params.allocateExecMessageId();
-        yield execMessage(execMessageId, execId, 'readArgs', args);
-        yield* finalizeExecTool({
+        yield* finalizeShellAwaitTool({
             session: params.session,
             toolName: tc.name,
             callId: tc.callId,
             cursorToolType,
-            execMessageId,
             modelCallId,
             startedArgs,
             input: sanitizedInput,
+            readArgs: {
+                path,
+                toolCallId: tc.callId,
+                ...(typeof sanitizedInput.offset === 'number' ? { offset: sanitizedInput.offset } : {}),
+                ...(typeof sanitizedInput.limit === 'number' ? { limit: sanitizedInput.limit } : {}),
+            },
+            blockUntilMs,
+            pattern: typeof sanitizedInput.pattern === 'string' ? sanitizedInput.pattern : undefined,
+            allocateExecMessageId: params.allocateExecMessageId,
             roundContext: params.roundContext,
             messages: params.messages,
             imageCollector: params.imageCollector,
@@ -355,20 +354,25 @@ async function* runToolCallInner(params: Parameters<typeof runToolCall>[0]): Asy
         return;
     }
 
-    if (cursorToolType === 'askQuestionToolCall' && params.session) {
+    // ── interaction 通道工具 ──
+    //
+    // AskQuestion / CreatePlan / SwitchMode / ConnectScm / McpAuth 的结果都来自一次
+    // 用户决策:发一条 interactionQuery,等对应的 interactionResponse。通道名与 query
+    // 载荷由各自 definition 声明 (ToolRegistryEntry.interaction),响应解包按
+    // cursorToolType 落在 toolkit/results 里,这里只负责驱动这条统一链路。
+    const interaction = findToolByAlias(executionToolName)?.interaction;
+    if (interaction && params.session) {
         yield* finalizeInteractionTool({
             session: params.session,
             interactionId: params.allocateInteractionId(),
-            queryCase: 'askQuestionInteractionQuery',
-            queryValue: {
-                args: startedArgs,
-                toolCallId: tc.callId,
-            },
-            expectedResponseCase: 'askQuestionInteractionResponse',
-            buildRawToolResult: (interactionResponse) => buildAskQuestionResultFromInteractionResponse(interactionResponse),
+            queryCase: interaction.queryCase,
+            queryValue: interaction.buildQueryValue(startedArgs, tc.callId, sanitizedInput),
+            expectedResponseCase: interaction.responseCase,
+            buildRawToolResult: interactionResponse =>
+                buildInteractionResponseToolResult(cursorToolType, interactionResponse, sanitizedInput),
             roundContext: params.roundContext,
             messages: params.messages,
-                        cursorToolType,
+            cursorToolType,
             toolName: tc.name,
             callId: tc.callId,
             startedArgs,
@@ -623,82 +627,10 @@ async function* runToolCallInner(params: Parameters<typeof runToolCall>[0]): Asy
         return
     }
 
-    // createPlanToolCall: 交互握手 (CreatePlanRequestQuery → CreatePlanRequestResponse)
-    if (cursorToolType === 'createPlanToolCall' && params.session) {
-        yield* finalizeInteractionTool({
-            session: params.session,
-            interactionId: params.allocateInteractionId(),
-            queryCase: 'createPlanRequestQuery',
-            queryValue: {
-                args: startedArgs,
-                toolCallId: tc.callId,
-            },
-            expectedResponseCase: 'createPlanRequestResponse',
-            buildRawToolResult: (interactionResponse) => {
-                const resp = interactionResponse as Record<string, unknown> | undefined;
-                // interactionResponse 结构: { id, createPlanRequestResponse: { result: { success:{}, planUri } } }
-                const inner = resp?.createPlanRequestResponse as Record<string, unknown> | undefined;
-                const result = inner?.result as Record<string, unknown> | undefined;
-                if (result?.success !== undefined) {
-                    return {
-                        result: { case: 'success', value: {} },
-                        ...(typeof result.planUri === 'string' ? { planUri: result.planUri } : {}),
-                    };
-                }
-                return { result: { case: 'error', value: { error: 'CreatePlan failed' } } };
-            },
-            roundContext: params.roundContext,
-            messages: params.messages,
-            cursorToolType,
-            toolName: tc.name,
-            callId: tc.callId,
-            startedArgs,
-            input: sanitizedInput,
-            modelCallId,
-        });
-        return;
-    }
-
-    // switchModeToolCall: 交互握手 (switchModeRequestQuery → switchModeRequestResponse)
-    // 抓包实证 (GPT.jsonl idx=27/6):
-    //   Server → Client: interactionQuery { switchModeRequestQuery { args { targetModeId, explanation, toolCallId } } }
-    //   Client → Server: interactionResponse { switchModeRequestResponse { approved {} } }
-    // 用户批准后才真正切换模式。
-    if (cursorToolType === 'switchModeToolCall' && params.session) {
-        yield* finalizeInteractionTool({
-            session: params.session,
-            interactionId: params.allocateInteractionId(),
-            queryCase: 'switchModeRequestQuery',
-            queryValue: {
-                args: startedArgs,
-                toolCallId: tc.callId,
-            },
-            expectedResponseCase: 'switchModeRequestResponse',
-            buildRawToolResult: (interactionResponse) => {
-                const resp = interactionResponse as Record<string, unknown> | undefined;
-                // interactionResponse 结构: { id, switchModeRequestResponse: { approved:{} } }
-                const inner = resp?.switchModeRequestResponse as Record<string, unknown> | undefined;
-                if (inner?.approved) {
-                    const targetModeId = typeof sanitizedInput.target_mode_id === 'string'
-                        ? sanitizedInput.target_mode_id
-                        : typeof sanitizedInput.targetModeId === 'string'
-                            ? sanitizedInput.targetModeId
-                            : 'agent';
-                    return { result: { case: 'success', value: { toModeId: targetModeId } } };
-                }
-                return { result: { case: 'error', value: { error: 'Mode switch rejected by user' } } };
-            },
-            roundContext: params.roundContext,
-            messages: params.messages,
-            cursorToolType,
-            toolName: tc.name,
-            callId: tc.callId,
-            startedArgs,
-            input: sanitizedInput,
-            modelCallId,
-        });
-        return;
-    }
+    // 由服务端就地给出结果的工具。少数工具的客户端效果承载在一条独立 update 上
+    // (如 SetActiveBranch 的 activeBranchChange),在结果帧之前发出。
+    for (const update of findToolByAlias(executionToolName)?.buildLocalUpdates?.(sanitizedInput, tc.callId) ?? [])
+        yield toolLocalUpdate(update.case, update.value);
 
     const finalized = finalizeToolCall({
         roundContext: params.roundContext,

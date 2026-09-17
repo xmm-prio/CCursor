@@ -8,10 +8,15 @@ import {
     type ToolResultEnvelope,
 } from './toolResults';
 import { finalizeToolCall } from './toolLifecycle';
-import { shellToolCallStderrDelta, shellToolCallStdoutDelta } from './stream';
-import { registerBackgroundJob, type AgentSession } from './session';
+import { execAbort, shellToolCallStderrDelta, shellToolCallStdoutDelta } from './stream';
+import { clearBackgroundJobs, registerBackgroundJob, type AgentSession } from './session';
+import { activeExecMessageIds, closeExecChannel } from './execChannels';
+import { createBoundedOutputBuffer } from './toolkit/results/shellOutputBuffer';
+import type { ShellStreamFailureReason } from './toolkit/results/shellToolResults';
 import type { ReadContextState } from './contextCatalog';
 import {
+    isAgentRunAbortedError,
+    releaseExec,
     waitForExecClientMessageWithHeartbeat,
     waitForExecStreamCloseWithHeartbeat,
     waitForShellExecEventWithHeartbeat,
@@ -41,7 +46,39 @@ function normalizeShellBackgroundReason(value: unknown): number | undefined {
     }
 }
 
-export async function* finalizeExecTool(params: {
+/**
+ * Ask the client to abort every exec still in flight and forget this run's background
+ * job registrations.
+ *
+ * The server never owns a process, so "reclaiming" an exec means telling the executor
+ * that runs it to stop: `ExecServerControlMessage.abort` is the only termination
+ * capability the protocol exposes. Channels are closed right after, because nobody will
+ * consume their events once the run is over.
+ *
+ * Note that already-backgrounded shells are out of reach: their exec has ended, and the
+ * protocol offers no shell_id-addressed kill.
+ */
+export function* abortInFlightExecs(
+    session: AgentSession,
+    reason: string,
+): Generator<AgentServerMessage, void, void> {
+    const execMessageIds = activeExecMessageIds(session);
+    for (const execMessageId of execMessageIds) {
+        yield execAbort(execMessageId);
+        closeExecChannel(session, execMessageId);
+    }
+    const backgroundJobs = clearBackgroundJobs(session);
+    if (execMessageIds.length > 0 || backgroundJobs.length > 0) {
+        logger.info({
+            requestId: session.requestId,
+            reason,
+            abortedExecs: execMessageIds,
+            backgroundJobs: backgroundJobs.length,
+        }, '[EXEC] aborting in-flight execs after run interruption');
+    }
+}
+
+export interface FinalizeExecToolParams {
     session: AgentSession;
     toolName: string;
     callId: string;
@@ -54,20 +91,58 @@ export async function* finalizeExecTool(params: {
     messages: LLMMessage[];
     imageCollector?: LLMContentBlock[];
     readContext?: ReadContextState;
-}): AsyncGenerator<AgentServerMessage, AgentServerMessage, void> {
+}
+
+/**
+ * Drive one exec to completion: stream its events, build the tool result, emit the
+ * completion frame.
+ *
+ * Wraps the exec lifecycle so that whatever happens the exec's event channel is
+ * released, and an interrupted run reclaims every exec still in flight.
+ */
+export async function* finalizeExecTool(
+    params: FinalizeExecToolParams,
+): AsyncGenerator<AgentServerMessage, AgentServerMessage, void> {
+    try {
+        return yield* runExecToCompletion(params);
+    } catch (error) {
+        if (isAgentRunAbortedError(error)) {
+            // An error carrying an execMessageId is the client telling us it already gave
+            // up on that exec — only the other in-flight execs still need reclaiming.
+            if (error.execMessageId !== undefined)
+                releaseExec(params.session, error.execMessageId);
+            yield* abortInFlightExecs(params.session, error.message);
+        }
+        throw error;
+    } finally {
+        releaseExec(params.session, params.execMessageId);
+    }
+}
+
+async function* runExecToCompletion(
+    params: FinalizeExecToolParams,
+): AsyncGenerator<AgentServerMessage, AgentServerMessage, void> {
     let toolResult: ToolResultEnvelope = { result: { case: 'error', value: { message: 'no result' } } };
     let completedFrame: AgentServerMessage | null = null;
 
     if (params.cursorToolType === 'shellToolCall') {
-        let stdout = '';
-        let stderr = '';
+        // Bounded accumulation (see shellOutputBuffer.ts) — a chatty command must not be
+        // able to grow the run's heap without limit.
+        const stdoutBuffer = createBoundedOutputBuffer();
+        const stderrBuffer = createBoundedOutputBuffer();
         let exitCode = 0;
         let cwd = '';
         let localExecTime = 0;
         let rejected: { reason?: string } | undefined;
         let permissionDenied: { command?: string; workingDirectory?: string; error?: string } | undefined;
         let backgrounded: { shellId: number; pid?: number; msToWait?: number; reason?: number; terminalsFolder?: string } | undefined;
-        let done = false;
+        /**
+         * Explicit terminal state. Only exit / backgrounded / rejected / permissionDenied
+         * are terminal; a stream that ends any other way leaves the exit status unknown
+         * and must not be reported as exitCode=0 success.
+         */
+        let terminalState: 'exit' | 'backgrounded' | 'rejected' | 'permissionDenied' | null = null;
+        let streamFailure: { reason: ShellStreamFailureReason } | undefined;
 
         const processShellMessage = function* (shellMsg: Record<string, unknown>): Generator<AgentServerMessage, void, void> {
             if ('execClientMessage' in shellMsg) {
@@ -75,12 +150,12 @@ export async function* finalizeExecTool(params: {
                 const ss = ecm.shellStream as Record<string, unknown> | undefined;
                 if (ss?.stdout) {
                     const chunk = String((ss.stdout as Record<string, unknown>).data ?? '');
-                    stdout += chunk;
+                    stdoutBuffer.append(chunk);
                     if (chunk) yield shellToolCallStdoutDelta(params.callId, chunk, params.modelCallId);
                 }
                 if (ss?.stderr) {
                     const chunk = String((ss.stderr as Record<string, unknown>).data ?? '');
-                    stderr += chunk;
+                    stderrBuffer.append(chunk);
                     if (chunk) yield shellToolCallStderrDelta(params.callId, chunk, params.modelCallId);
                 }
                 if (ss?.permissionDenied) {
@@ -90,12 +165,12 @@ export async function* finalizeExecTool(params: {
                         workingDirectory: typeof denied.workingDirectory === 'string' ? denied.workingDirectory : undefined,
                         error: typeof denied.error === 'string' ? denied.error : undefined,
                     };
-                    done = true;
+                    terminalState = 'permissionDenied';
                 }
                 if (ss?.rejected) {
                     const rejectedPayload = ss.rejected as Record<string, unknown>;
                     rejected = { reason: typeof rejectedPayload.reason === 'string' ? rejectedPayload.reason : undefined };
-                    done = true;
+                    terminalState = 'rejected';
                 }
                 if (ss?.backgrounded) {
                     // 命令转后台 (ShellStreamBackgrounded)。执行侧主导转后台,server 是接收方:
@@ -123,37 +198,46 @@ export async function* finalizeExecTool(params: {
                         });
                     }
                     logger.info({ tool: params.toolName, callId: params.callId, shellId, reason, msToWait }, '[TOOL] shell moved to background');
-                    done = true;
+                    terminalState = 'backgrounded';
                 }
                 if (ss?.exit) {
                     const exit = ss.exit as Record<string, unknown>;
                     cwd = typeof exit.cwd === 'string' ? exit.cwd : '';
                     localExecTime = typeof exit.localExecutionTimeMs === 'number' ? exit.localExecutionTimeMs : 0;
                     exitCode = typeof exit.code === 'number' ? (exit.code | 0) : 0;
-                    done = true;
+                    terminalState = 'exit';
                 }
             }
             if ('execClientControlMessage' in shellMsg) {
                 const ctrl = shellMsg.execClientControlMessage as Record<string, unknown>;
-                if (ctrl.streamClose) done = true;
+                // streamClose ends the stream whatever state we are in, but it is not a
+                // terminal event: arriving before exit means the command's fate is unknown.
+                if (ctrl.streamClose && terminalState === null)
+                    streamFailure = { reason: 'streamClosedBeforeExit' };
             }
         };
 
         logger.info({ tool: params.toolName, callId: params.callId }, '[TOOL] waiting for shell approval/execution start');
-        const firstShellMsg = yield* waitForShellExecEventWithHeartbeat(params.session, params.execMessageId, null);
-        if (firstShellMsg) {
-            yield* processShellMessage(firstShellMsg);
-        } else {
-            done = true;
-        }
-
-        while (!done) {
+        while (terminalState === null && streamFailure === undefined) {
             const shellMsg = yield* waitForShellExecEventWithHeartbeat(params.session, params.execMessageId, null);
             if (!shellMsg) {
-                done = true;
+                // Cancellation surfaces as AgentRunAbortedError from the waiter, so a null
+                // here is a dropped/timed-out stream, not a user interrupt.
+                streamFailure = { reason: 'streamEndedWithoutExit' };
                 break;
             }
             yield* processShellMessage(shellMsg);
+        }
+
+        if (streamFailure) {
+            logger.warn({
+                tool: params.toolName,
+                callId: params.callId,
+                execMessageId: params.execMessageId,
+                reason: streamFailure.reason,
+                stdoutChars: stdoutBuffer.totalChars,
+                stderrChars: stderrBuffer.totalChars,
+            }, '[TOOL] shell stream ended without a terminal event');
         }
 
         const finalized = finalizeToolCall({
@@ -164,14 +248,15 @@ export async function* finalizeExecTool(params: {
             callId: params.callId,
             startedArgs: params.startedArgs,
             rawToolResult: buildShellToolResult(params.input, {
-                stdout,
-                stderr,
+                stdout: stdoutBuffer.text,
+                stderr: stderrBuffer.text,
                 exitCode,
                 cwd,
                 localExecutionTimeMs: localExecTime,
                 rejected,
                 permissionDenied,
                 backgrounded,
+                streamFailure,
             }),
             input: params.input,
             modelCallId: params.modelCallId,
@@ -182,8 +267,10 @@ export async function* finalizeExecTool(params: {
             params.imageCollector.push(finalized.imageBlock);
         logger.info({
             tool: params.toolName,
-            stdoutLen: stdout.length,
-            stderrLen: stderr.length,
+            terminalState: terminalState ?? 'none',
+            stdoutChars: stdoutBuffer.totalChars,
+            stderrChars: stderrBuffer.totalChars,
+            elidedChars: stdoutBuffer.elidedChars + stderrBuffer.elidedChars,
             exitCode,
             execTime: localExecTime,
         }, '[TOOL] shell exec completed');
@@ -213,7 +300,22 @@ export async function* finalizeExecTool(params: {
                 params.imageCollector.push(finalized.imageBlock);
             logger.info({ tool: params.toolName }, '[TOOL] exec result received');
         } else {
-            logger.warn({ tool: params.toolName }, '[TOOL] exec ended without result');
+            // The generic `no result` fallback must never be what the model sees: say
+            // which exec ended and how, so the failure is diagnosable from the transcript.
+            toolResult = {
+                result: {
+                    case: 'error',
+                    value: {
+                        message: `Exec stream for ${params.toolName} ended without a result `
+                            + '(the client closed the stream or the wait timed out).',
+                    },
+                },
+            };
+            logger.warn({
+                tool: params.toolName,
+                callId: params.callId,
+                execMessageId: params.execMessageId,
+            }, '[TOOL] exec ended without result');
         }
 
         yield* waitForExecStreamCloseWithHeartbeat(

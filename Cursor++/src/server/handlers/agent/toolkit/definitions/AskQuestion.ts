@@ -248,4 +248,9 @@ export const AskQuestionTool: ToolRegistryEntry = {
         runAsync: bool(input.runAsync),
         asyncOriginalToolCallId: str(input.asyncOriginalToolCallId),
     }),
+    interaction: {
+        queryCase: 'askQuestionInteractionQuery',
+        responseCase: 'askQuestionInteractionResponse',
+        buildQueryValue: (startedArgs, callId) => ({ args: startedArgs, toolCallId: callId }),
+    },
 };

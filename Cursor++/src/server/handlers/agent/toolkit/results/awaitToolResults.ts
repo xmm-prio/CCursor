@@ -76,6 +76,51 @@ export function buildAwaitExecToolResult(
     return null;
 }
 
+/** How a bounded AwaitShell poll loop ended (see awaitRuntime.ts). */
+export interface ShellAwaitStatus {
+    outcome: 'completed' | 'patternMatched' | 'stillRunning' | 'unreadable';
+    polls: number;
+    waitedMs: number;
+}
+
+function buildAwaitStatusNote(status: ShellAwaitStatus): string {
+    const waited = `after polling for ${status.waitedMs}ms (${status.polls} read${status.polls === 1 ? '' : 's'})`;
+    switch (status.outcome) {
+        case 'completed':
+            return `[AwaitShell] The command finished ${waited}; the exit_code footer above is final.`;
+        case 'patternMatched':
+            return `[AwaitShell] The requested pattern matched ${waited}; the command is still running.`;
+        default:
+            return `[AwaitShell] The command is still running ${waited}; `
+                + 'this is a snapshot, not the final output. Poll again to keep monitoring.';
+    }
+}
+
+/**
+ * Append the poll-loop verdict to a terminal-file snapshot.
+ *
+ * Without it the model cannot tell "finished" from "still running" — both come back as
+ * a successful file read — which is exactly how a stale snapshot gets mistaken for the
+ * final output.
+ */
+export function annotateShellAwaitResult(
+    envelope: ToolResultEnvelope,
+    status: ShellAwaitStatus,
+): ToolResultEnvelope {
+    const value = obj(envelope.result?.value);
+    const output = obj(value.output);
+    if (envelope.result?.case !== 'success' || output.case !== 'content') return envelope;
+    return {
+        result: {
+            case: 'success',
+            value: {
+                ...value,
+                output: { case: 'content', value: `${str(output.value)}\n\n${buildAwaitStatusNote(status)}` },
+            },
+        },
+    };
+}
+
 export function normalizeAwaitToolResult(
     cursorToolType: string,
     resultCaseName: string,

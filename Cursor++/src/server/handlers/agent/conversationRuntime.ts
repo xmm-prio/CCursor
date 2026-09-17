@@ -17,6 +17,7 @@ import { buildMessages, workspaceUris } from './protocol'
 import { checkpoint, editToolCallStreamDelta, heartbeat, kvMessage, partialToolCall, summary, summaryCompleted, summaryStarted, translateStream, userMessageAppended } from './stream'
 import { buildSummaryUserMessage, SUMMARY_SYSTEM_PROMPT } from './summaryPrompt'
 import { finalizeTaskResult, launchTaskTool, runToolCall, type TaskLaunchContext } from './toolRuntime'
+import { abortInFlightExecs } from './execRuntime'
 import { awaitExecResultAndClose, waitForPromiseWithHeartbeat } from './wait'
 import { restoreBlobMessageToLLMMessage } from './transcript'
 import { ActiveTurnTracker, createCurrentTurnUserMessageBlob, readTurnBaseline } from './turnTracker'
@@ -1431,6 +1432,9 @@ export async function* handleConversationRun(
           execMessageId: e.execMessageId,
           error: e.message,
         }, '[AGENT] tool call wait aborted by client; ending current run')
+        // 并发 Task 分支不经 finalizeExecTool 收尾,在途 exec 只能在这里回收。
+        if (session)
+          yield* abortInFlightExecs(session, e.message)
         return
       }
 

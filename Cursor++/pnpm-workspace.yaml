@@ -1,3 +1,8 @@
 allowBuilds:
   esbuild: true
   protobufjs: true
+  # Required by `vsce package`: vsce-sign fetches its platform signing binary
+  # and keytar builds the native credential bindings during postinstall.
+  '@vscode/vsce-sign': true
+  keytar: true
+  '@google/genai': true

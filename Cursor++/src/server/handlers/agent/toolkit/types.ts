@@ -67,12 +67,52 @@ export function filterToolsForMode(tools: LLMTool[], mode: string, isSubagent = 
     }
 }
 
+/**
+ * Interaction-channel descriptor.
+ *
+ * Tools whose result comes from a user decision (approval dialogs, mode switches,
+ * OAuth prompts) have no exec channel: the server sends one `interactionQuery` and
+ * blocks on the matching `interactionResponse`. Declaring the two case names here lets
+ * toolRuntime drive every such tool through a single generic branch; unpacking the
+ * response stays in toolkit/results, keyed by cursorToolType.
+ */
+export interface ToolInteractionDescriptor {
+    queryCase: string;
+    responseCase: string;
+    buildQueryValue: (
+        startedArgs: Record<string, unknown>,
+        callId: string,
+        input: Record<string, unknown>,
+    ) => Record<string, unknown>;
+}
+
+/** An extra interactionUpdate frame emitted next to a locally resolved tool result. */
+export interface ToolLocalUpdate {
+    case: string;
+    value: Record<string, unknown>;
+}
+
 export interface ToolRegistryEntry {
     canonicalName: string;
     /** 所有 provider 可能使用的工具名。LLM 回调时用 findToolByAlias() 匹配。 */
     aliases: string[];
     cursorToolType: string;
     execArgsType: string | null;
+    /**
+     * One-line reminder kept in the static preamble when the tool is hidden behind the
+     * `cursor` dynamic namespace. Mirrors the official `contextType.conciseStaticContext`.
+     */
+    conciseStaticContext?: string;
+    /** Set when the tool resolves through the interaction channel instead of an exec. */
+    interaction?: ToolInteractionDescriptor;
+    /**
+     * Frames the tool emits before its locally built result — used by tools whose effect
+     * on the client is carried by a dedicated update rather than by the tool call itself.
+     */
+    buildLocalUpdates?: (
+        input: Record<string, unknown>,
+        callId: string,
+    ) => ToolLocalUpdate[];
     /**
      * 按 provider 族分化的 LLM 工具定义。
      * 包含该工具面向 LLM 的 name / description / inputSchema。

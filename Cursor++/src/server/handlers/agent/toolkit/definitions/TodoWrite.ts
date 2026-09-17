@@ -408,6 +408,7 @@ export const TodoWriteTool: ToolRegistryEntry = {
     aliases: ["TodoWrite"],
     cursorToolType: 'updateTodosToolCall',
     execArgsType: null,
+    conciseStaticContext: 'Use this tool to manage complex multi-step tasks.',
     llmToolByProvider: {
         anthropic: ANTHROPIC,
         openai: OPENAI,

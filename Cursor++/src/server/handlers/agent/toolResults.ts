@@ -5,13 +5,18 @@ import {
     normalizeFileToolResult,
 } from './toolkit/results/fileToolResults';
 import {
-    buildAskQuestionResultFromInteractionResponse,
+    buildInteractionResponseToolResult,
     buildInteractionToolResultText,
     buildLocalInteractionToolResult,
     buildWebFetchApprovalResultFromInteractionResponse,
     buildWebSearchApprovalResultFromInteractionResponse,
     normalizeInteractionToolResult,
 } from './toolkit/results/interactionToolResults';
+import {
+    buildShellStdinExecToolResult,
+    buildShellStdinToolResultText,
+    normalizeShellStdinToolResult,
+} from './toolkit/results/shellStdinToolResults';
 import {
     buildMcpExecToolResult,
     buildMcpToolResultText,
@@ -41,7 +46,7 @@ import { obj, str, truncate, type ToolResultEnvelope } from './toolkit/results/s
 
 export type { ToolResultEnvelope } from './toolkit/results/shared';
 export {
-    buildAskQuestionResultFromInteractionResponse,
+    buildInteractionResponseToolResult,
     buildShellToolResult,
     buildWebFetchApprovalResultFromInteractionResponse,
     buildWebSearchApprovalResultFromInteractionResponse,
@@ -57,6 +62,7 @@ export function buildExecToolResult(
             ?? buildFileExecToolResult(cursorToolType, execClientMsg, input)
             ?? buildAwaitExecToolResult(cursorToolType, execClientMsg, input)
             ?? (cursorToolType === 'taskToolCall' ? buildTaskExecToolResult(execClientMsg) : null)
+            ?? buildShellStdinExecToolResult(cursorToolType, execClientMsg, input)
             ?? buildMcpExecToolResult(cursorToolType, execClientMsg, input)
             ?? { result: { case: 'error', value: { message: `unsupported exec tool ${cursorToolType}` } } };
     } catch (e) {
@@ -85,6 +91,7 @@ export function normalizeToolResult(
         ?? (cursorToolType === 'taskToolCall' ? normalizeTaskToolResult(resultCaseName, value) : null)
         ?? (cursorToolType === 'communicateUpdateToolCall' ? { result: { case: resultCaseName || 'success', value } } : null)
         ?? normalizeMcpToolResult(cursorToolType, resultCaseName, value, input)
+        ?? normalizeShellStdinToolResult(cursorToolType, resultCaseName, value, input)
         ?? (cursorToolType === 'shellToolCall' ? normalizeShellToolResult(resultCaseName, value, input) : null)
         ?? { result: { case: resultCaseName || 'error', value } };
 }
@@ -94,6 +101,8 @@ export function isToolResultError(toolResult: ToolResultEnvelope): boolean {
     switch (str(result.case)) {
         case 'error':
         case 'failure':
+        // Shell spawn failures — including our aborted-stream reports — are errors too.
+        case 'spawnError':
         case 'rejected':
         case 'permissionDenied':
         case 'writePermissionDenied':
@@ -113,6 +122,7 @@ export function buildToolResultText(
     const value = obj(result.value);
 
     return (cursorToolType === 'shellToolCall' ? buildShellToolResultText(resultCaseName, value, input) : null)
+        ?? buildShellStdinToolResultText(cursorToolType, resultCaseName, value, input)
         ?? buildAwaitToolResultText(cursorToolType, resultCaseName, value)
         ?? buildSearchToolResultText(cursorToolType, resultCaseName, value, input)
         ?? buildFileToolResultText(cursorToolType, resultCaseName, value, input)

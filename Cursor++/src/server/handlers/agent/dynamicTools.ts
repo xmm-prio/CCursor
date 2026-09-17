@@ -61,12 +61,6 @@ export interface CursorDynamicToolDefinition {
     conciseStaticContext?: string;
 }
 
-const DYNAMIC_TOOL_CONCISE_CONTEXT: Record<string, string> = {
-    TodoWrite: 'Use this tool to manage complex multi-step tasks.',
-    ReadLints: 'Check for linter errors after substantive edits.',
-    SwitchMode: 'Switch between available modes. Proactively consider switching modes for relevant requests.',
-};
-
 export function buildCursorNamespaceDescription(tools: CursorDynamicToolDefinition[]): string {
     const instructions = tools.flatMap(tool => tool.conciseStaticContext
         ? [`- ${tool.tool}: ${tool.conciseStaticContext}`]
@@ -114,7 +108,8 @@ export function partitionCursorBuiltinTools(
     const staticTools: LLMTool[] = [];
     const dynamicTools: CursorDynamicToolDefinition[] = [];
     for (const tool of tools) {
-        const canonicalName = findToolByAlias(tool.name)?.canonicalName ?? tool.name;
+        const entry = findToolByAlias(tool.name);
+        const canonicalName = entry?.canonicalName ?? tool.name;
         if (FINAL_PROFILE_STATIC_TOOLS.has(canonicalName)) {
             staticTools.push(tool);
             continue;
@@ -123,8 +118,8 @@ export function partitionCursorBuiltinTools(
             tool: tool.name,
             description: tool.description,
             inputSchema: normalizeDynamicBuiltinSchema(tool.inputSchema) as Record<string, unknown>,
-            ...(DYNAMIC_TOOL_CONCISE_CONTEXT[canonicalName]
-                ? { conciseStaticContext: DYNAMIC_TOOL_CONCISE_CONTEXT[canonicalName] }
+            ...(entry?.conciseStaticContext
+                ? { conciseStaticContext: entry.conciseStaticContext }
                 : {}),
         });
     }

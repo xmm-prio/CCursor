@@ -1,6 +1,7 @@
 import type { AgentServerMessage } from '../../gen/agent_v1_pb';
 import { AGENT_HEARTBEAT_INTERVAL_MS } from './constants';
-import { waitForInteractionResponse, waitForMessageMatching, type AgentSession } from './session';
+import { closeExecChannel } from './execChannels';
+import { waitForExecEventMatching, waitForInteractionResponse, waitForMessageMatching, type AgentSession } from './session';
 import { heartbeat } from './stream';
 
 export class AgentRunAbortedError extends Error {
@@ -30,6 +31,14 @@ export function throwIfSessionCancelled(session: AgentSession): void {
     if (session.cancelledReason === undefined)
         return;
     throw new AgentRunAbortedError(`client cancelled the run: ${session.cancelledReason}`);
+}
+
+/**
+ * Release the event channel of an exec — call once the tool call owning it is done,
+ * whether it completed, failed, or was aborted.
+ */
+export function releaseExec(session: AgentSession, execMessageId: number): void {
+    closeExecChannel(session, execMessageId);
 }
 
 export function isExecClientMessageForId(msg: Record<string, unknown>, execMessageId: number): boolean {
@@ -66,8 +75,9 @@ export async function waitForExecMessageMatching(
     predicate: (msg: Record<string, unknown>) => boolean,
     timeoutMs: number | null,
 ): Promise<Record<string, unknown> | null> {
-    const msg = await waitForMessageMatching(
+    const msg = await waitForExecEventMatching(
         session,
+        execMessageId,
         (candidate) => predicate(candidate) || !!getExecThrowForId(candidate, execMessageId),
         timeoutMs,
     );
@@ -192,19 +202,23 @@ export async function awaitExecResultAndClose(
     execMessageId: number,
     timeoutMs: number | null = null,
 ): Promise<Record<string, unknown> | null> {
-    const execResult = await waitForExecMessageMatching(
-        session,
-        execMessageId,
-        msg => isExecClientMessageForId(msg, execMessageId),
-        timeoutMs,
-    );
-    await waitForExecMessageMatching(
-        session,
-        execMessageId,
-        msg => isExecStreamCloseForId(msg, execMessageId),
-        5_000,
-    ).catch(() => {});
-    return execResult;
+    try {
+        const execResult = await waitForExecMessageMatching(
+            session,
+            execMessageId,
+            msg => isExecClientMessageForId(msg, execMessageId),
+            timeoutMs,
+        );
+        await waitForExecMessageMatching(
+            session,
+            execMessageId,
+            msg => isExecStreamCloseForId(msg, execMessageId),
+            5_000,
+        ).catch(() => {});
+        return execResult;
+    } finally {
+        releaseExec(session, execMessageId);
+    }
 }
 
 export async function* waitForShellExecEventWithHeartbeat(

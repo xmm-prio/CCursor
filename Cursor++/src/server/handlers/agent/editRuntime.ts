@@ -23,6 +23,7 @@ import {
 import { finalizeToolCall } from './toolLifecycle';
 import type { AgentSession } from './session';
 import {
+    releaseExec,
     waitForExecClientMessageWithHeartbeat,
     waitForExecStreamCloseWithHeartbeat,
 } from './wait';
@@ -288,6 +289,7 @@ export async function* finalizeEditToolCall(params: {
     yield execMessage(readExecMsgId, `${callId}-read`, 'readArgs', { path, toolCallId: callId });
     const readFrame = yield* waitForExecClientMessageWithHeartbeat(params.session, readExecMsgId, null);
     yield* waitForExecStreamCloseWithHeartbeat(params.session, readExecMsgId, null);
+    releaseExec(params.session, readExecMsgId);
     yield heartbeat();
 
     const readOutcome = extractReadOutcome(readFrame);
@@ -341,6 +343,7 @@ export async function* finalizeEditToolCall(params: {
     });
     const writeFrame = yield* waitForExecClientMessageWithHeartbeat(params.session, writeExecMsgId, null);
     yield* waitForExecStreamCloseWithHeartbeat(params.session, writeExecMsgId, null);
+    releaseExec(params.session, writeExecMsgId);
 
     const writeError = extractWriteError(writeFrame);
     if (writeError) {

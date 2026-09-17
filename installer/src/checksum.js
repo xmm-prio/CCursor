@@ -13,6 +13,19 @@ function computeHash(filePath) {
     .replace(/=+$/, '');
 }
 
+/**
+ * Does product.json carry a checksum table? The REH server build ships one
+ * without, so nothing there ever rewrites or backs up product.json.
+ */
+export function hasChecksumTable(paths) {
+  try {
+    return Boolean(JSON.parse(readFileSync(paths.productJson, 'utf-8')).checksums);
+  }
+  catch {
+    return false;
+  }
+}
+
 export function updateChecksums(paths, modifiedFiles, tag, log) {
   const product = JSON.parse(readFileSync(paths.productJson, 'utf-8'));
   if (!product.checksums) {

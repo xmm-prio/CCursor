@@ -8,8 +8,8 @@ import * as acorn from 'acorn';
 import { createBackup } from './backup.js';
 import { updateChecksums } from './checksum.js';
 import { loadRoutes } from './routes.js';
-import { BASE_REDIRECT } from './defaults.js';
-import { DEFAULT_REDIRECT } from './defaults.js';
+import { BASE_REDIRECT, BYOK_REDIRECT } from './defaults.js';
+import { buildEndpointCandidates, buildRendererChannelSource } from './routes-channel.js';
 
 const HOOK_MARKER = '__byokWrapTransport';
 const HOOK_SOURCE_MARKER = 'CURSOR-BYOK-HOOK-START';
@@ -113,25 +113,28 @@ function findFunctionStarts(source, from, windowSize) {
 //   2. REST 端点重定向到本地 BYOK server
 //   3. __byokRefreshModels —— 主动触发模型列表刷新 (借用 captureAiServiceRef
 //      在 workbench.js 里泄漏到 globalThis 的 aiService 引用)
-//   4. setInterval 轮询本地 server /byok/refresh-signal,counter 变化时调
-//      __byokRefreshModels(),实现 toggle BYOK Mode 后自动刷新模型选择器
+//   4. routes channel (routes-channel.js) —— 端点发现 + 启动期就绪门控 +
+//      routes 热更新 + refresh 事件订阅, 取代早期的轮询与写死端点
 
-function buildHookPayload(hasGlass) {
+export function buildHookPayload(hasGlass) {
   const routes = loadRoutes();
-  const BYOK_HOST = routes.server.host;
-  const BYOK_PORT = routes.server.port;
   const COLLECTOR_HOST = routes.collector.host;
   const COLLECTOR_PORT = routes.collector.port;
   // REST redirect 初始列表仅含 BASE_REDIRECT (stripe profile stub),
   // 保证 Cursor 启动时 /auth/poll 等登录关键端点不被拦截。
-  // 完整 BYOK 列表由 server 就绪后通过 SSE event:routes 推送。
+  // 完整白名单由 server 就绪后经 routes channel 下发。
   const restRedirects = BASE_REDIRECT.filter(r => r.startsWith('REST:')).map(r => r.slice(5));
   const restListJson = JSON.stringify(restRedirects);
+  // 端点发现 + 就绪门控 + routes 热更新 —— 见 routes-channel.js
+  const channel = buildRendererChannelSource({
+    candidates: buildEndpointCandidates(routes.server),
+    byokRedirect: BYOK_REDIRECT,
+  });
 
   // 主体: collector observation + transport wrap + REST 重定向
   // unary/stream 包装中, 在调原始 transport 之前向 headers 注入 x-client-wid,
   // 后续 server 端直接从请求头读取, 无需 clientKey 映射。
-  const main = `(function(){if(globalThis.__byokReady)return;globalThis.__byokReady=true;var _hasGlass=${hasGlass ? 'true' : 'false'};var _q=globalThis.__byokQueue=[];var _collectorUrl="http://${COLLECTOR_HOST}:${COLLECTOR_PORT}";var _byokUrl="http://${BYOK_HOST}:${BYOK_PORT}";var _sending=false;var _down=false;var _restPaths=${restListJson};var _restSet=new Set(_restPaths);function __byokLog(e){if(_down)return;e._t=Date.now();_q.push(e);if(!_sending)_flush()}function _flush(){if(_down||!_q.length){_sending=false;return}_sending=true;var batch=_q.splice(0,50);fetch(_collectorUrl+"/hook",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(batch)}).then(function(){}).catch(function(){_down=true;_q.length=0;console.warn("[BYOK] Collector not reachable at "+_collectorUrl+", logging disabled for this session")}).finally(function(){if(!_down)setTimeout(_flush,100);else _sending=false})}function __byokMsgToJson(e){if(!e)return null;try{if(typeof e.toJson==="function")return e.toJson()}catch(x){}try{if(typeof e.toJsonString==="function")return JSON.parse(e.toJsonString())}catch(x){}return e}function __byokHeadersToObj(e){if(!e)return{};try{if(e instanceof Headers)return Object.fromEntries(e)}catch(x){}return typeof e==="object"?e:{}}function __byokCloneBody(r){if(!r.body)return Promise.resolve(null);try{return r.clone().text()}catch(e){return Promise.resolve(null)}}function __byokInjectWid(hdrs){var wid=typeof window!=="undefined"&&window.vscodeWindowId;if(typeof wid!=="number")return hdrs;var widStr=String(wid);try{if(hdrs&&typeof hdrs.set==="function"){hdrs.set("x-client-wid",widStr);return hdrs}if(hdrs&&typeof hdrs==="object"&&!Array.isArray(hdrs)){hdrs["x-client-wid"]=widStr;return hdrs}if(Array.isArray(hdrs)){hdrs.push(["x-client-wid",widStr]);return hdrs}}catch(e){}var h=new Headers();h.set("x-client-wid",widStr);return h}globalThis.__byokWrapTransport=function(t,n){return{unary:async function(e,r,i,o,s,a,c){s=__byokInjectWid(s);var u=Math.random().toString(36).slice(2,10),l=Date.now();__byokLog({type:"unary_req",id:u,svc:e.typeName,mtd:r.name,hdr:__byokHeadersToObj(s),msg:__byokMsgToJson(a)});try{var d=await t.unary(e,r,i,o,s,a,c);__byokLog({type:"unary_res",id:u,dur:Date.now()-l,svc:e.typeName,mtd:r.name,msg:__byokMsgToJson(d.message)});return d}catch(d){__byokLog({type:"unary_err",id:u,dur:Date.now()-l,svc:e.typeName,mtd:r.name,err:d?.message||String(d),code:d?.code});throw d}},stream:async function(e,r,i,o,s,a,c){s=__byokInjectWid(s);var u=Math.random().toString(36).slice(2,10),l=Date.now();__byokLog({type:"stream_req",id:u,svc:e.typeName,mtd:r.name,hdr:__byokHeadersToObj(s)});var f=(async function*(){var t=0;for await(var n of a){__byokLog({type:"stream_in",id:u,svc:e.typeName,mtd:r.name,idx:t++,msg:__byokMsgToJson(n)});yield n}})();try{var d=await t.stream(e,r,i,o,s,f,c),h=d.message;d.message=(async function*(){var t=0;for await(var n of h){__byokLog({type:"stream_out",id:u,svc:e.typeName,mtd:r.name,idx:t++,msg:__byokMsgToJson(n)});yield n}__byokLog({type:"stream_end",id:u,dur:Date.now()-l,svc:e.typeName,mtd:r.name,chunks:t})})();return d}catch(d){__byokLog({type:"stream_err",id:u,dur:Date.now()-l,svc:e.typeName,mtd:r.name,err:d?.message||String(d),code:d?.code});throw d}}}};if(_restPaths.length>0){var _origFetch=globalThis.fetch;globalThis.fetch=function(){var args=Array.prototype.slice.call(arguments);var urlArg=args[0];var u=typeof urlArg==="string"?urlArg:(urlArg instanceof Request?urlArg.url:"");var init=args[1]||{};for(var i=0;i<_restPaths.length;i++){if(u.indexOf(_restPaths[i])!==-1){var id=Math.random().toString(36).slice(2,10);var ts=Date.now();var reqMethod=init.method||(urlArg instanceof Request?urlArg.method:"GET")||"GET";var reqHeaders=__byokHeadersToObj(urlArg instanceof Request?urlArg.headers:init.headers);var reqBody=urlArg instanceof Request&&urlArg.body?urlArg.body:(init.body||null);var path=_restPaths[i];var newUrl=_byokUrl+(u.match(/^https?:\\/\\/[^/]*/)?u.replace(/^https?:\\/\\/[^/]*/,""):"/");__byokLog({type:"rest_redirect",id:id,path:path,originalUrl:u,redirectUrl:newUrl,method:reqMethod,reqHeaders:reqHeaders,reqBody:reqBody});var newInit=Object.assign({},init);newInit.headers=__byokInjectWid(newInit.headers);var newArgs=[newUrl,newInit];for(var j=2;j<args.length;j++)newArgs.push(args[j]);return _origFetch.apply(globalThis,newArgs).then(function(resp){var r=resp.clone();__byokLog({type:"rest_response",id:id,path:path,status:r.status,resHeaders:__byokHeadersToObj(r.headers)});__byokCloneBody(r).then(function(text){if(text){__byokLog({type:"rest_body",id:id,path:path,body:text})}}).catch(function(){});return resp}).catch(function(err){__byokLog({type:"rest_error",id:id,path:path,error:err?.message||String(err)});throw err})}}if(u.indexOf(_byokUrl)===0){var nInit=Object.assign({},init);nInit.headers=__byokInjectWid(nInit.headers);var nArgs=[urlArg,nInit];for(var k=2;k<args.length;k++)nArgs.push(args[k]);return _origFetch.apply(globalThis,nArgs)}return _origFetch.apply(globalThis,arguments)}}`;
+  const main = `(function(){if(globalThis.__byokReady)return;globalThis.__byokReady=true;var _hasGlass=${hasGlass ? 'true' : 'false'};var _q=globalThis.__byokQueue=[];var _collectorUrl="http://${COLLECTOR_HOST}:${COLLECTOR_PORT}";var _sending=false;var _down=false;var _restPaths=${restListJson};var _restSet=new Set(_restPaths);function __byokLog(e){if(_down)return;e._t=Date.now();_q.push(e);if(!_sending)_flush()}function _flush(){if(_down||!_q.length){_sending=false;return}_sending=true;var batch=_q.splice(0,50);fetch(_collectorUrl+"/hook",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(batch)}).then(function(){}).catch(function(){_down=true;_q.length=0;console.warn("[BYOK] Collector not reachable at "+_collectorUrl+", logging disabled for this session")}).finally(function(){if(!_down)setTimeout(_flush,100);else _sending=false})}function __byokMsgToJson(e){if(!e)return null;try{if(typeof e.toJson==="function")return e.toJson()}catch(x){}try{if(typeof e.toJsonString==="function")return JSON.parse(e.toJsonString())}catch(x){}return e}function __byokHeadersToObj(e){if(!e)return{};try{if(e instanceof Headers)return Object.fromEntries(e)}catch(x){}return typeof e==="object"?e:{}}function __byokCloneBody(r){if(!r.body)return Promise.resolve(null);try{return r.clone().text()}catch(e){return Promise.resolve(null)}}function __byokInjectWid(hdrs){var wid=typeof window!=="undefined"&&window.vscodeWindowId;if(typeof wid!=="number")return hdrs;var widStr=String(wid);try{if(hdrs&&typeof hdrs.set==="function"){hdrs.set("x-client-wid",widStr);return hdrs}if(hdrs&&typeof hdrs==="object"&&!Array.isArray(hdrs)){hdrs["x-client-wid"]=widStr;return hdrs}if(Array.isArray(hdrs)){hdrs.push(["x-client-wid",widStr]);return hdrs}}catch(e){}var h=new Headers();h.set("x-client-wid",widStr);return h}globalThis.__byokWrapTransport=function(t,n){return{unary:async function(e,r,i,o,s,a,c){if(_byokGated(e.typeName,r.name))await __byokAwaitReady();s=__byokInjectWid(s);var u=Math.random().toString(36).slice(2,10),l=Date.now();__byokLog({type:"unary_req",id:u,svc:e.typeName,mtd:r.name,hdr:__byokHeadersToObj(s),msg:__byokMsgToJson(a)});try{var d=await t.unary(e,r,i,o,s,a,c);__byokLog({type:"unary_res",id:u,dur:Date.now()-l,svc:e.typeName,mtd:r.name,msg:__byokMsgToJson(d.message)});return d}catch(d){__byokLog({type:"unary_err",id:u,dur:Date.now()-l,svc:e.typeName,mtd:r.name,err:d?.message||String(d),code:d?.code});throw d}},stream:async function(e,r,i,o,s,a,c){if(_byokGated(e.typeName,r.name))await __byokAwaitReady();s=__byokInjectWid(s);var u=Math.random().toString(36).slice(2,10),l=Date.now();__byokLog({type:"stream_req",id:u,svc:e.typeName,mtd:r.name,hdr:__byokHeadersToObj(s)});var f=(async function*(){var t=0;for await(var n of a){__byokLog({type:"stream_in",id:u,svc:e.typeName,mtd:r.name,idx:t++,msg:__byokMsgToJson(n)});yield n}})();try{var d=await t.stream(e,r,i,o,s,f,c),h=d.message;d.message=(async function*(){var t=0;for await(var n of h){__byokLog({type:"stream_out",id:u,svc:e.typeName,mtd:r.name,idx:t++,msg:__byokMsgToJson(n)});yield n}__byokLog({type:"stream_end",id:u,dur:Date.now()-l,svc:e.typeName,mtd:r.name,chunks:t})})();return d}catch(d){__byokLog({type:"stream_err",id:u,dur:Date.now()-l,svc:e.typeName,mtd:r.name,err:d?.message||String(d),code:d?.code});throw d}}}};var _origFetch=globalThis.fetch;function _byokFetch(args){var urlArg=args[0];var u=typeof urlArg==="string"?urlArg:(urlArg instanceof Request?urlArg.url:"");var init=args[1]||{};for(var i=0;i<_restPaths.length;i++){if(u.indexOf(_restPaths[i])!==-1){var id=Math.random().toString(36).slice(2,10);var ts=Date.now();var reqMethod=init.method||(urlArg instanceof Request?urlArg.method:"GET")||"GET";var reqHeaders=__byokHeadersToObj(urlArg instanceof Request?urlArg.headers:init.headers);var reqBody=urlArg instanceof Request&&urlArg.body?urlArg.body:(init.body||null);var path=_restPaths[i];var newUrl=_byokUrl+(u.match(/^https?:\\/\\/[^/]*/)?u.replace(/^https?:\\/\\/[^/]*/,""):"/");__byokLog({type:"rest_redirect",id:id,path:path,originalUrl:u,redirectUrl:newUrl,method:reqMethod,reqHeaders:reqHeaders,reqBody:reqBody});var newInit=Object.assign({},init);newInit.headers=__byokInjectWid(newInit.headers);var newArgs=[newUrl,newInit];for(var j=2;j<args.length;j++)newArgs.push(args[j]);return _origFetch.apply(globalThis,newArgs).then(function(resp){var r=resp.clone();__byokLog({type:"rest_response",id:id,path:path,status:r.status,resHeaders:__byokHeadersToObj(r.headers)});__byokCloneBody(r).then(function(text){if(text){__byokLog({type:"rest_body",id:id,path:path,body:text})}}).catch(function(){});return resp}).catch(function(err){__byokLog({type:"rest_error",id:id,path:path,error:err?.message||String(err)});throw err})}}if(u.indexOf(_byokUrl)===0){var nInit=Object.assign({},init);nInit.headers=__byokInjectWid(nInit.headers);var nArgs=[urlArg,nInit];for(var k=2;k<args.length;k++)nArgs.push(args[k]);return _origFetch.apply(globalThis,nArgs)}return _origFetch.apply(globalThis,args)}globalThis.fetch=function(){var args=Array.prototype.slice.call(arguments);var first=args[0];var probe=typeof first==="string"?first:(first instanceof Request?first.url:"");if(_byokGatedPath(probe))return __byokAwaitReady().then(function(){return _byokFetch(args)});return _byokFetch(args)};`;
 
   // 模型列表刷新机制
   // __byokAiSvc 由 captureAiServiceRef 在 workbench.js 字符串重写时泄漏到 globalThis,
@@ -168,9 +171,12 @@ function buildHookPayload(hasGlass) {
   //   样式: 去边框, 缩小, 继承前景色
   const glassStatus = `(function(){var _bEl=null,_bTip=null,_bSrv=false,_bMode=false;function _bCreate(){var e=document.createElement("button");e.type="button";e.className="ui-icon-button";e.dataset.variant="default";e.dataset.size="lg";e.id="byok-glass-status";if(_hasGlass){var donor=document.querySelector("button.ui-icon-button");if(donor){e.className=donor.className}else{e.className="ui-icon-button"}e.style.cssText="width:auto;min-width:auto;font-size:10px;gap:2px;white-space:nowrap;"}else{e.className="ui-icon-button";e.dataset.variant="default";e.dataset.size="lg";e.style.cssText="font-size:11px;gap:3px;width:auto;white-space:nowrap;"}e.addEventListener("click",function(){fetch(_byokUrl+"/byok/toggle",{method:"POST"}).then(function(r){return r.json()}).then(function(d){console.log("[BYOK] toggle \\u2192",d.byokMode?"ON":"OFF")}).catch(function(e){console.warn("[BYOK] toggle failed:",e&&e.message||e)})});e.addEventListener("mouseenter",function(){_bShowTip()});e.addEventListener("mouseleave",function(){_bHideTip()});return e}function _bShowTip(){if(_bTip||!_bEl)return;var t=document.createElement("div");t.className="ui-tooltip";t.setAttribute("role","tooltip");t.style.cssText="position:fixed;z-index:99999;pointer-events:none;box-sizing:border-box;width:max-content;max-width:320px;background:var(--cursor-bg-elevated);color:var(--cursor-text-primary);border:var(--ui-tooltip-border-width,1px) solid var(--cursor-stroke-primary);border-radius:var(--ui-tooltip-border-radius,var(--cursor-radius-lg));box-shadow:var(--ui-tooltip-box-shadow,var(--cursor-box-shadow-popup));padding:var(--ui-tooltip-padding-y,var(--cursor-spacing-1-5)) var(--ui-tooltip-padding-x,var(--cursor-spacing-2-5));font-size:var(--ui-tooltip-font-size,var(--cursor-font-size-base));line-height:var(--ui-tooltip-line-height,var(--cursor-line-height-base));letter-spacing:var(--ui-tooltip-letter-spacing,var(--cursor-letter-spacing-base));white-space:pre-line;";t.textContent=(_bSrv?"Server online":"Server offline")+" \\u00B7 "+(_bMode?"BYOK ON":"BYOK OFF");document.body.appendChild(t);var r=_bEl.getBoundingClientRect();var tw=t.offsetWidth,th=t.offsetHeight;t.style.left=Math.round(r.left+r.width/2-tw/2)+"px";t.style.top=Math.round(r.top-th-6)+"px";_bTip=t}function _bHideTip(){if(_bTip){_bTip.remove();_bTip=null}}function _bRender(){if(!_bEl)return;var icon=_bSrv?"\\u2713":"\\u2717";var glyph=_bMode?"\\u25C9":"\\u25CB";_bEl.textContent=icon+" BYOK "+glyph}function _bInject(){if(_bEl&&document.contains(_bEl))return;var footer=document.querySelector('[data-component="glass-sidebar-footer"]');if(footer){var gear=footer.querySelector("button.ui-icon-button");if(gear&&gear.parentElement){_bEl=_bCreate();_bRender();gear.parentElement.insertBefore(_bEl,gear);return}}var trigger=document.querySelector(".glass-sidebar-footer-account-trigger");var endIcon=trigger&&trigger.querySelector(".ui-sidebar-menu-button-end");if(trigger&&endIcon){_bEl=_bCreate();_bRender();trigger.insertBefore(_bEl,endIcon);return}var actOld=document.querySelector(".glass-sidebar-footer-actions-right");if(actOld){_bEl=_bCreate();_bRender();actOld.insertBefore(_bEl,actOld.firstChild)}}if(document.body){var _bObs=new MutationObserver(function(){_bInject()});_bObs.observe(document.body,{childList:true,subtree:true});_bInject()}globalThis.__byokGlassStatus=function(srv,mode){if(srv!==void 0)_bSrv=srv;if(mode!==void 0)_bMode=mode;_bRender()}})();`;
 
-  const refreshLogic = `globalThis.__byokRefreshModels=function(){if(globalThis.__byokAiSvc&&typeof globalThis.__byokAiSvc.refreshDefaultModels==="function"){try{var p=globalThis.__byokAiSvc.refreshDefaultModels();console.log("[BYOK] refreshDefaultModels() invoked via captured aiService ref");if(p&&typeof p.then==="function")p.catch(function(e){console.warn("[BYOK] refreshDefaultModels failed:",e&&e.message||e)});return"service"}catch(e){console.warn("[BYOK] refreshDefaultModels threw:",e&&e.message||e)}}var btn=document.querySelector('[title="Refresh model list"]');if(btn&&typeof btn.click==="function"){btn.click();console.log("[BYOK] refresh triggered via DOM click fallback");return"click"}console.warn("[BYOK] no refresh mechanism available (aiService not captured, picker not visible)");return"none"};try{var _byokEs=new EventSource(_byokUrl+"/byok/events");_byokEs.addEventListener("open",function(){globalThis.__byokGlassStatus&&globalThis.__byokGlassStatus(true,_restPaths.length>2)});_byokEs.addEventListener("refresh",function(){console.log("[BYOK] refresh event received");globalThis.__byokRefreshModels&&globalThis.__byokRefreshModels()});_byokEs.addEventListener("routes",function(ev){try{var newPaths=JSON.parse(ev.data);_restPaths=newPaths;_restSet=new Set(newPaths);console.log("[BYOK] REST redirects hot-reloaded: "+newPaths.length+" paths");globalThis.__byokGlassStatus&&globalThis.__byokGlassStatus(void 0,newPaths.length>2)}catch(e){console.warn("[BYOK] routes event parse failed:",e&&e.message||e)}});_byokEs.addEventListener("error",function(){globalThis.__byokGlassStatus&&globalThis.__byokGlassStatus(false,void 0)})}catch(e){console.warn("[BYOK] EventSource init failed:",e&&e.message||e)}`;
+  const refreshLogic = `globalThis.__byokRefreshModels=function(){if(globalThis.__byokAiSvc&&typeof globalThis.__byokAiSvc.refreshDefaultModels==="function"){try{var p=globalThis.__byokAiSvc.refreshDefaultModels();console.log("[BYOK] refreshDefaultModels() invoked via captured aiService ref");if(p&&typeof p.then==="function")p.catch(function(e){console.warn("[BYOK] refreshDefaultModels failed:",e&&e.message||e)});return"service"}catch(e){console.warn("[BYOK] refreshDefaultModels threw:",e&&e.message||e)}}var btn=document.querySelector('[title="Refresh model list"]');if(btn&&typeof btn.click==="function"){btn.click();console.log("[BYOK] refresh triggered via DOM click fallback");return"click"}console.warn("[BYOK] no refresh mechanism available (aiService not captured, picker not visible)");return"none"};`;
 
-  return main + refreshLogic + pickerRefresh + glassStatus + `console.log("[BYOK] Hook loaded, collector="+_collectorUrl+", byok="+_byokUrl+", REST redirects="+_restPaths.length)})()`;
+  // 顺序有意义: channel 在初始化末尾立即开始端点探测, 依赖前面 main 里
+  // 声明的 _origFetch / _restPaths, 也依赖 refreshLogic 之后才可用的
+  // __byokRefreshModels (仅在事件回调里惰性引用, 不影响初始化)。
+  return main + refreshLogic + channel + pickerRefresh + glassStatus + `console.log("[BYOK] Hook loaded, collector="+_collectorUrl+", byok candidates="+_byokCandidates.join(", "))})()`;
 }
 
 // ---- AST fingerprinting + patch ----
@@ -577,37 +583,144 @@ function patchKatexMathSvgSanitizer(code, log) {
   return result;
 }
 
+/**
+ * Agent Window (glass) 扩展白名单放行。
+ *
+ * 白名单由两个数组定义: 一个"核心"数组 (内置 deeplink / socket / auth 扩展),
+ * 一个"远程"数组 (remote-ssh / wsl / containers)。两者各被多处引用
+ * (函数返回值、.filter()、.includes()、派生的组合数组), 所以只改数组定义,
+ * 全部引用点自动生效。
+ *
+ * 跨版本策略:
+ * - 不依赖"某个成员恰好在数组末尾"。旧锚点 '"anysphere.remote-wsl"]' 在
+ *   remote-containers 追加到其后就失效了, 而它失效时 installer 只发 warning,
+ *   核心数组仍能命中, 于是静默半成功。
+ * - 改为: 用成员字面量定位候选, 回退到数组定义处, 用 AST 校验
+ *   `<ident> = [ ...<base>, "a", "b", ... ]` 的形态, 再在 ']' 之前追加。
+ * - 两个数组必须各命中恰好一次, 否则抛错而不是告警。
+ *
+ * 注意: installer production build 会经过 js-confuser。这里刻意写成单函数 +
+ * 命令式循环, 避免复杂 helper/callback 在混淆后触发错误重命名。
+ */
 function patchGlassExtensionAllowlist(code, log) {
-  // Agent Window 扩展白名单由 Jes (hD) 和 Ges (fD) 两个数组控制。
-  // 6 处引用: 定义、Vn1 函数返回、2 个 .filter() 、1 个 .includes() 、组合数组。
-  // 最可靠的方式: 直接修改数组定义,所有引用点自动生效。
-  //
-  // 定位策略: Jes 数组末尾紧跟 "],Ges=["，用这个跨数组边界的唯一指纹定位。
-  // Ges 数组末尾紧跟 "],t$h=[" 或类似模式。
-  const entry = `,"${EXTENSION_ID}"`;
+  const allowlists = [
+    {
+      label: 'core',
+      probe: '"vscode.github-authentication"',
+      members: ['anysphere.cursor-deeplink', 'anysphere.cursor-resolver-helper', 'anysphere.cursor-socket', 'vscode.github-authentication'],
+    },
+    {
+      label: 'remote',
+      probe: '"anysphere.remote-wsl"',
+      members: ['anysphere.remote-ssh', 'anysphere.remote-wsl', 'anysphere.remote-containers'],
+    },
+  ];
+
+  function definitionStart(arrayStart) {
+    let i = arrayStart - 1;
+    while (i >= 0 && /\s/.test(code[i])) i--;
+    if (code[i] !== '=') return -1;
+    i--;
+    while (i >= 0 && /\s/.test(code[i])) i--;
+    const end = i + 1;
+    while (i >= 0 && /[a-zA-Z0-9_$]/.test(code[i])) i--;
+    const start = i + 1;
+    return start === end ? -1 : start;
+  }
+
+  // `<ident> = [ ...<base>, "a", "b" ]` —— 前导 spread 是这两个白名单数组的
+  // 结构特征, 用它把同样含有这些成员的扁平字面量数组区分开。
+  function allowlistArray(expr, required) {
+    const node = expr && expr.type === 'SequenceExpression' ? expr.expressions[0] : expr;
+    if (!node || node.type !== 'AssignmentExpression' || node.operator !== '=') return undefined;
+    if (!node.left || node.left.type !== 'Identifier') return undefined;
+    const array = node.right;
+    if (!array || array.type !== 'ArrayExpression') return undefined;
+    if (!array.elements.length || array.elements[0].type !== 'SpreadElement') return undefined;
+
+    const values = [];
+    for (let i = 1; i < array.elements.length; i++) {
+      const element = array.elements[i];
+      if (!element || element.type !== 'Literal' || typeof element.value !== 'string') return undefined;
+      values.push(element.value);
+    }
+    for (let i = 0; i < required.length; i++) {
+      if (!values.includes(required[i])) return undefined;
+    }
+    return { name: node.left.name, array, values };
+  }
+
+  const edits = [];
+  const report = [];
+
+  for (let a = 0; a < allowlists.length; a++) {
+    const spec = allowlists[a];
+    const matches = [];
+    const seen = [];
+    let scanFrom = 0;
+
+    while (true) {
+      const probeIdx = code.indexOf(spec.probe, scanFrom);
+      if (probeIdx === -1) break;
+      scanFrom = probeIdx + spec.probe.length;
+
+      const arrayStart = code.lastIndexOf('[', probeIdx);
+      if (arrayStart === -1) continue;
+      const exprStart = definitionStart(arrayStart);
+      if (exprStart === -1 || seen.includes(exprStart)) continue;
+
+      let parsed;
+      try {
+        parsed = acorn.parseExpressionAt(code, exprStart, { ecmaVersion: 2022, sourceType: 'script' });
+      } catch {
+        continue;
+      }
+
+      const found = allowlistArray(parsed, spec.members);
+      if (!found) continue;
+      seen.push(exprStart);
+      matches.push(found);
+    }
+
+    if (matches.length === 0) {
+      throw new Error(`glass-allowlist: ${spec.label} extension allowlist array not found`);
+    }
+    if (matches.length > 1) {
+      const names = matches.map(m => m.name).join(', ');
+      throw new Error(`glass-allowlist: ${spec.label} extension allowlist array is ambiguous (${names})`);
+    }
+
+    const target = matches[0];
+    if (target.values.includes(EXTENSION_ID)) {
+      report.push(`${spec.label}=${target.name} (already present)`);
+      continue;
+    }
+    edits.push({ start: target.array.end - 1, text: `,${JSON.stringify(EXTENSION_ID)}` });
+    report.push(`${spec.label}=${target.name}`);
+  }
+
+  edits.sort((x, y) => y.start - x.start);
   let result = code;
-  let patched = 0;
-
-  // Jes = [...baseList, ..., "vscode.github-authentication"]  ← 追加到此处
-  const jesEnd = '"vscode.github-authentication"]';
-  if (result.includes(jesEnd)) {
-    result = result.replace(jesEnd, `"vscode.github-authentication"${entry}]`);
-    patched++;
+  for (let i = 0; i < edits.length; i++) {
+    result = result.slice(0, edits[i].start) + edits[i].text + result.slice(edits[i].start);
   }
-
-  // Ges = [...baseList, ..., "anysphere.remote-wsl"]  ← 追加到此处
-  const gesEnd = '"anysphere.remote-wsl"]';
-  if (result.includes(gesEnd)) {
-    result = result.replace(gesEnd, `"anysphere.remote-wsl"${entry}]`);
-    patched++;
-  }
-
-  if (patched === 0) {
-    log?.('  [glass-allowlist] WARNING: allowlist arrays not found, skipping');
-  } else {
-    log?.(`  [glass-allowlist] injected ${EXTENSION_ID} into ${patched} allowlist array(s)`);
-  }
+  log?.(`  [glass-allowlist] ${EXTENSION_ID} in ${allowlists.length} allowlist array(s): ${report.join(', ')}`);
   return result;
+}
+
+/**
+ * Dry-run the allowlist locator so `ccursor check` fails on the same conditions
+ * `ccursor install` would throw on.
+ * @returns {{ ok: boolean, detail: string }}
+ */
+export function checkGlassExtensionAllowlist(code) {
+  let detail = '';
+  try {
+    patchGlassExtensionAllowlist(code, msg => { detail = msg.trim(); });
+    return { ok: true, detail };
+  } catch (e) {
+    return { ok: false, detail: e.message };
+  }
 }
 
 function patchSingleWorkbench(filePath, label, paths, log) {

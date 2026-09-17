@@ -31,8 +31,81 @@ export function buildLocalInteractionToolResult(cursorToolType: string, input: R
             return { result: { case: 'error', value: { error: 'web fetch is not implemented yet', url: str(input.url) } } };
         case 'askQuestionToolCall':
             return { result: { case: 'error', value: { errorMessage: 'ask question response missing' } } };
+        case 'createGoalToolCall':
+            // Goals are declarative: the client renders them and the model is expected to
+            // keep honouring the objective, so recording the call is the whole effect.
+            return { result: { case: 'success', value: {} } };
+        case 'updateGoalToolCall':
+            return { result: { case: 'success', value: { status: enumLike(input.status, 0) } } };
+        case 'setActiveBranchToolCall':
+            // The branch itself travels in the activeBranchChange update emitted alongside.
+            return { result: { case: 'success', value: {} } };
         default:
             return null;
+    }
+}
+
+/**
+ * Unpack an `interactionResponse` into the tool's own result envelope.
+ *
+ * Every tool declaring `interaction` in the registry lands here; a missing case is an
+ * error rather than a silent success so a half-wired tool cannot report progress it
+ * never made.
+ */
+export function buildInteractionResponseToolResult(
+    cursorToolType: string,
+    response: Record<string, unknown> | null,
+    input: Record<string, unknown>,
+): ToolResultEnvelope {
+    switch (cursorToolType) {
+        case 'askQuestionToolCall':
+            return buildAskQuestionResultFromInteractionResponse(response);
+        case 'createPlanToolCall': {
+            const result = obj(obj(response).createPlanRequestResponse).result as Record<string, unknown> | undefined;
+            if (result?.success !== undefined) {
+                return {
+                    result: { case: 'success', value: {} },
+                    ...(typeof result.planUri === 'string' ? { planUri: result.planUri } : {}),
+                } as ToolResultEnvelope;
+            }
+            return { result: { case: 'error', value: { error: 'CreatePlan failed' } } };
+        }
+        case 'switchModeToolCall': {
+            const inner = obj(obj(response).switchModeRequestResponse);
+            if (inner.approved) {
+                return {
+                    result: {
+                        case: 'success',
+                        value: { toModeId: str(input.target_mode_id ?? input.targetModeId, 'agent') },
+                    },
+                };
+            }
+            return { result: { case: 'error', value: { error: 'Mode switch rejected by user' } } };
+        }
+        case 'connectScmToolCall': {
+            const inner = obj(obj(response).connectScmRequestResponse);
+            if (inner.approved) return { result: { case: 'success', value: {} } };
+            if (inner.rejected)
+                return { result: { case: 'rejected', value: { reason: str(obj(inner.rejected).reason, 'rejected') } } };
+            if (inner.failed)
+                return { result: { case: 'error', value: { error: str(obj(inner.failed).error, 'connect github failed') } } };
+            return { result: { case: 'error', value: { error: 'missing connect github response' } } };
+        }
+        case 'mcpAuthToolCall': {
+            const inner = obj(obj(response).mcpAuthRequestResponse);
+            const serverIdentifier = str(input.serverIdentifier ?? input.server ?? input.namespace);
+            if (inner.approved) return { result: { case: 'success', value: { serverIdentifier } } };
+            if (inner.rejected)
+                return { result: { case: 'rejected', value: { reason: str(obj(inner.rejected).reason, 'rejected') } } };
+            return { result: { case: 'error', value: { error: 'missing MCP authorization response' } } };
+        }
+        default:
+            return {
+                result: {
+                    case: 'error',
+                    value: { error: `no interaction result handler for ${cursorToolType}` },
+                },
+            };
     }
 }
 
@@ -131,6 +204,30 @@ export function buildInteractionToolResultText(
         case 'webFetchToolCall':
         case 'askQuestionToolCall':
             return truncate(JSON.stringify(toolResult, null, 2), 12000);
+        case 'createGoalToolCall':
+            return resultCaseName === 'success'
+                ? 'Goal created'
+                : `Error creating goal: ${str(value.error, resultCaseName || 'unknown error')}`;
+        case 'updateGoalToolCall':
+            return resultCaseName === 'success'
+                ? `Goal status updated to ${String(enumLike(value.status, 'unknown'))}`
+                : `Error updating goal: ${str(value.error, resultCaseName || 'unknown error')}`;
+        case 'setActiveBranchToolCall':
+            return resultCaseName === 'success'
+                ? 'Active branch metadata updated'
+                : `Failed to update active branch: ${str(value.error, resultCaseName || 'unknown error')}`;
+        case 'connectScmToolCall':
+            switch (resultCaseName) {
+                case 'success': return 'GitHub connected';
+                case 'rejected': return `Connect GitHub declined: ${str(value.reason, 'rejected')}`;
+                default: return `Connect GitHub failed: ${str(value.error, resultCaseName || 'unknown error')}`;
+            }
+        case 'mcpAuthToolCall':
+            switch (resultCaseName) {
+                case 'success': return `Authenticated MCP server ${str(value.serverIdentifier, 'server')}`;
+                case 'rejected': return `MCP authorization declined: ${str(value.reason, 'rejected')}`;
+                default: return `MCP authorization failed: ${str(value.error, resultCaseName || 'unknown error')}`;
+            }
         default:
             return null;
     }

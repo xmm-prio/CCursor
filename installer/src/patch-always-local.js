@@ -1,5 +1,9 @@
 /**
- * Legacy Always-Local Patch — shared HTTP/1.1 router + readiness wait + signature bypass.
+ * Legacy Always-Local Patch — shared HTTP/1.1 router + readiness wait.
+ *
+ * cursor-always-local declares `extensionKind: ["ui"]`, so this patch only
+ * applies to a tree that runs UI extensions. The signature bypass it used to
+ * carry moved to patch-sig-bypass.js, which the server profile needs too.
  */
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import * as acorn from 'acorn';
@@ -11,7 +15,6 @@ import { disableAgentWebSocket, hasAgentWebSocketStack, isAgentWebSocketDisabled
 
 export const ALWAYS_LOCAL_ROUTER_MARKER = '__byokUrlRewrite';
 export const WAIT_MARKER = '__byokWaitServer';
-const SIG_PATTERN = /if\(!\w\.valid\)/;
 
 /** Shared router payload for the legacy Agent process. */
 function buildPayload() {
@@ -25,7 +28,6 @@ export function patchAlwaysLocal(paths, log) {
   log?.('[always-local] Patching...');
 
   if (!existsSync(paths.alwaysLocalMain)) throw new Error(`Not found: ${paths.alwaysLocalMain}`);
-  if (!existsSync(paths.extensionHostJs)) throw new Error(`Not found: ${paths.extensionHostJs}`);
 
   const modified = [];
   const original = readFileSync(paths.alwaysLocalMain, 'utf-8');
@@ -58,21 +60,6 @@ export function patchAlwaysLocal(paths, log) {
     createBackup(paths.alwaysLocalMain, 'always-local', log);
     writeFileSync(paths.alwaysLocalMain, patched);
     modified.push(paths.alwaysLocalMain);
-  }
-
-  // 4. Built-in extension signature bypass.
-  const ehCode = readFileSync(paths.extensionHostJs, 'utf-8');
-  const ehPatched = ehCode.includes('if(!1)') && !SIG_PATTERN.test(ehCode);
-  if (ehPatched) {
-    log?.('  extensionHostProcess sig bypass already applied');
-  }
-  else {
-    const match = ehCode.match(SIG_PATTERN);
-    if (!match) throw new Error('Signature validation pattern not found');
-    createBackup(paths.extensionHostJs, 'always-local', log);
-    writeFileSync(paths.extensionHostJs, ehCode.replace(SIG_PATTERN, 'if(!1)'));
-    modified.push(paths.extensionHostJs);
-    log?.(`  Sig bypass: ${match[0]} → if(!1)`);
   }
 
   if (modified.length > 0) updateChecksums(paths, modified, 'always-local', log);

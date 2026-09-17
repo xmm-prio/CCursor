@@ -22,7 +22,7 @@ import { logger } from '../../logger';
 import type { AgentServerMessage } from '../../gen/agent_v1_pb';
 import type { AgentSession } from './session';
 import { execMessage } from './stream';
-import { waitForExecClientMessageWithHeartbeat } from './wait';
+import { releaseExec, waitForExecClientMessageWithHeartbeat } from './wait';
 
 /** 取 MCP state 的等待上限 — 客户端需向各 MCP server 查询,放宽于 blob 取回 */
 const MCP_STATE_TIMEOUT_MS = 30_000;
@@ -170,6 +170,7 @@ export async function* fetchMcpState(params: {
         execId,
         MCP_STATE_TIMEOUT_MS,
     );
+    releaseExec(params.session, execId);
 
     if (!msg) {
         logger.warn({ execId, serverIdentifiers: params.serverIdentifiers, elapsedMs: Date.now() - startedAt },

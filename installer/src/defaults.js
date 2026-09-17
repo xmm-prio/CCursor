@@ -19,6 +19,28 @@ export const DEFAULT_PORT = 39831;
 export const DEFAULT_COLLECTOR_PORT = 14800;
 
 /**
+ * How many consecutive ports starting at server.port may be claimed.
+ *
+ * The extension walks the span upwards when the preferred port is taken, and
+ * the injected consumers (renderer hook, node router) walk the very same span
+ * when probing for the server, so a shifted server stays discoverable without
+ * re-running the installer.
+ */
+export const PORT_FALLBACK_SPAN = 8;
+
+/**
+ * SSE event names on /byok/events.
+ *
+ * `routes` carries the legacy payload (a bare array of REST paths) and exists
+ * only for renderer hooks injected by an older installer. `routes-v2` carries
+ * the full routes payload (endpoint + REST + ConnectRPC whitelist) and is the
+ * channel every current consumer subscribes to.
+ */
+export const SSE_EVENT_ROUTES_LEGACY = 'routes';
+export const SSE_EVENT_ROUTES = 'routes-v2';
+export const ROUTES_PAYLOAD_VERSION = 2;
+
+/**
  * BASE_REDIRECT —— 不论 BYOK 开关如何,**永远**生效的劫持白名单。
  *
  * 当前只包含"假装订阅"的 2 个 Stripe profile stub。

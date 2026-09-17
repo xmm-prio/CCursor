@@ -12,9 +12,13 @@ import {
   DEFAULT_PORT,
   ROUTES_FILE_NAME,
 } from './defaults.js';
+import { buildNodeChannelSource } from './routes-channel.js';
 
-export const HTTP11_ROUTER_VERSION_MARKER = '__byokHttp11RouterV2';
-export const HTTP11_ROUTER_SOURCE_MARKER = 'BYOK-HTTP11-ROUTER-V2';
+// V3 adds the routes channel subscription next to the routes.json watcher.
+// The version is part of the marker so a bundle carrying the older payload is
+// recognised as stale instead of being reported as already patched.
+export const HTTP11_ROUTER_VERSION_MARKER = '__byokHttp11RouterV3';
+export const HTTP11_ROUTER_SOURCE_MARKER = 'BYOK-HTTP11-ROUTER-V3';
 
 /**
  * @param {{ guardMarker: string, processLabel: string }} options
@@ -58,7 +62,20 @@ export function buildNodeHttp11RouterPayload({ guardMarker, processLabel }) {
     return{host:host,port:port,base:baseUrl(host,port),svcSet:svcSet,methodSet:methodSet,restSet:restSet,ruleCount:ruleCount,restCount:restCount};
   }catch(e){return emptyState();}}
   function applyState(event){state=loadConfig();console.log("[BYOK] "+PROCESS_LABEL+" "+event+" -> "+state.base+" (ConnectRPC="+state.ruleCount+", REST="+state.restCount+")");}
+  function applyPayload(payload){
+    if(!payload||typeof payload!=="object")return;
+    var srv=payload.server||{},host=srv.host||state.host,port=srv.port||state.port;
+    var svcSet=new Set(payload.services||[]),methodSet=new Set(payload.methods||[]),restSet=new Set(payload.rest||[]);
+    var moved=String(host)!==String(state.host)||String(port)!==String(state.port);
+    state={host:host,port:port,base:baseUrl(host,port),svcSet:svcSet,methodSet:methodSet,restSet:restSet,ruleCount:svcSet.size+methodSet.size,restCount:restSet.size};
+    console.log("[BYOK] "+PROCESS_LABEL+" routes pushed -> "+state.base+" (ConnectRPC="+state.ruleCount+", REST="+state.restCount+")");
+    // Endpoint moved (port fallback): drop the stream so the channel
+    // resubscribes against the new base instead of a dead socket.
+    if(moved){if(_chEs){try{_chEs.destroy();}catch(e){}}_chRetry=200;_chReset();}
+  }
   applyState("routes loaded");
+  // routes.json 轮询是兜底: server 离线期间只有它能反映外部改动。
+  // server 在线时由 routes channel 即时下发, 消除 2s 陈旧窗口。
   try{_fs.watchFile(ROUTES_PATH,{interval:2000,persistent:false},function(){applyState("routes reloaded");});}catch(e){console.warn("[BYOK] "+PROCESS_LABEL+" watchFile failed: "+e.message);}
   function normalizeHost(host){return String(host||"").trim().replace(/^\\[|\\]$/g,"").toLowerCase();}
   function isCursorApiHost(host){host=normalizeHost(host);return/(^|\\.)api[234]\\.cursor\\.sh$|(^|\\.)api5\\.cursor\\.sh$|(^|\\.)gcpp\\.cursor\\.sh$|^api\\.playground\\.cursor\\.sh$/.test(host);}
@@ -84,6 +101,7 @@ export function buildNodeHttp11RouterPayload({ guardMarker, processLabel }) {
   function interceptGet(isHttps){return function(input,options,callback){var parsed=parseRequest(input);if(parsed&&((isCursorApiHost(parsed.hostname)&&shouldRedirect(parsed.path))||isConfiguredLocal(parsed))){var request=(isHttps?_https:_http).request(input,options,callback);request.end();return request;}var original=isHttps?_proxyHttpsGet:_proxyHttpGet;return original.call(isHttps?_https:_http,input,options,callback);};}
   _http.request=interceptRequest(false);_https.request=interceptRequest(true);_http.get=interceptGet(false);_https.get=interceptGet(true);
   try{if(typeof _module.syncBuiltinESMExports==="function")_module.syncBuiltinESMExports();}catch(e){console.warn("[BYOK] "+PROCESS_LABEL+" syncBuiltinESMExports failed: "+e.message);}
+  ${buildNodeChannelSource()}
   console.log("[BYOK] "+PROCESS_LABEL+" HTTP/1.1 whitelist router active (config: "+ROUTES_PATH+")");
 })();
 /* ${HTTP11_ROUTER_SOURCE_MARKER}-END */\n`;
@@ -97,5 +115,6 @@ export function isNodeHttp11RouterPatched(source, guardMarker) {
     && head.includes(guardMarker)
     && head.includes('_http.request=interceptRequest(false)')
     && head.includes('_https.request=interceptRequest(true)')
-    && head.includes('_module.syncBuiltinESMExports');
+    && head.includes('_module.syncBuiltinESMExports')
+    && head.includes('_chConnect();');
 }

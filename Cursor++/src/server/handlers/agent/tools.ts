@@ -42,6 +42,7 @@
  */
 
 import { logger } from '../../logger';
+import { MCP_AUTH_TOOL } from './dynamicTools';
 import type { EditPlan } from './toolkit/editPlans';
 import { buildRegisteredEditPlan, buildRegisteredExecArgs, findToolByAlias, findToolByCursorType } from './toolRegistry';
 import type { ToolExecBuildOptions } from './toolkit/types';
@@ -352,6 +353,17 @@ export function resolveToolCall(
                 cursorToolType,
                 sanitizedInput: sanitizeToolInput(toolName, args),
                 effectiveToolName: toolName,
+            };
+        }
+
+        // mcp_auth 不是 MCP server 自己的工具 —— 它由服务端凭空补进每个 MCP namespace
+        // (dynamicTools.ts 的 MCP_AUTH_TOOL),所以在路由表里永远找不到。它走
+        // mcpAuthToolCall + mcpAuthRequestQuery 的授权握手,而不是 mcpArgs。
+        if (toolName === MCP_AUTH_TOOL.tool && server) {
+            return {
+                cursorToolType: 'mcpAuthToolCall',
+                sanitizedInput: { serverIdentifier: server },
+                effectiveToolName: MCP_AUTH_TOOL.tool,
             };
         }
 

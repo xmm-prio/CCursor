@@ -38,6 +38,10 @@ function mergeWithDefaults(loaded) {
     server: {
       host: loaded.server?.host ?? fallback.server.host,
       port: loaded.server?.port ?? fallback.server.port,
+      // Only present when the extension host runs remotely (Remote SSH / WSL).
+      ...(typeof loaded.server?.externalUrl === 'string' && loaded.server.externalUrl
+        ? { externalUrl: loaded.server.externalUrl }
+        : {}),
     },
     collector: {
       host: loaded.collector?.host ?? fallback.collector.host,

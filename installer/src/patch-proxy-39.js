@@ -1,23 +1,33 @@
 /**
- * Cursor 3.9+ Always-Local Singleton BYOK Fix
+ * Utility-process BYOK router (Cursor 3.9 – 3.18, "proxy-39")
  *
- * Cursor 3.8 introduced alwaysLocalSingletonMain.js, but 3.9 moved the active
- * AiService HTTP/1.1 transport into that singleton utility process and inlined
+ * Cursor 3.8 introduced alwaysLocalSingletonMain.js, and 3.9 moved the active
+ * AiService HTTP/1.1 transport into that singleton utility process, inlining
  * @connectrpc/connect-node's transport code with ESM namespace imports:
  *   import * as X from "http" / "https"; X.request(...)
  *
- * The legacy BYOK router lives in extensions/cursor-always-local/dist/main.js,
- * which is a different extension-host process. Therefore 3.9 AvailableModels
- * can bypass BYOK entirely unless we install the whitelist router inside the
- * singleton process too.
+ * The extension-host routers (cursor-always-local, cursor-agent-host) cannot
+ * reach across that process boundary, so the whitelist router has to be
+ * installed inside the utility process as well. The patch does two things,
+ * right after VSCode's own proxy-agent patch is installed:
+ *   1. install a BYOK http/https.request whitelist router;
+ *   2. (< 3.11.25 only) call module.syncBuiltinESMExports() so the ESM
+ *      namespace imports used by the inlined HTTP/1.1 transport see the
+ *      patched request functions. 3.11.25+ calls syncBuiltinESMExports natively.
  *
- * This patch does two things after VSCode's proxy-agent patch is installed:
- *   1. install a BYOK http/https.request whitelist router in singleton process;
- *   2. (< 3.11.25 only) call module.syncBuiltinESMExports() so ESM namespace
- *      imports used by the inlined HTTP/1.1 transport see the patched request
- *      functions. 3.11.25+ calls syncBuiltinESMExports natively.
+ * 3.19 removed the singleton utility process altogether — out/vs/code/
+ * electron-utility/ only holds conversationSearch / mcpProcess / sharedProcess,
+ * none of which carries an AiService transport. The transport is back in the
+ * cursor-always-local and cursor-agent-host extension hosts, both already
+ * covered by their own routers.
+ *
+ * Therefore the target is discovered, never assumed: every utility-process
+ * bundle is fingerprinted for an AiService HTTP/1.1 transport. No match means
+ * the patch is retired for this version; a match without the proxy-agent
+ * install site means the layout moved and is reported as a failure rather than
+ * silently skipped.
  */
-import { existsSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, readFileSync, readdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { createBackup } from './backup.js';
 import { updateChecksums } from './checksum.js';
@@ -29,6 +39,11 @@ const SYNC_CALL_MARKER = '/*BYOK-PROXY39*/';
 const ROUTER_MARKER = '__byokSingletonUrlRewrite';
 const ROUTER_CALL_MARKER = '/*BYOK-SINGLETON-ROUTER*/';
 const TARGET_REL = 'out/vs/code/electron-utility/alwaysLocalSingleton/alwaysLocalSingletonMain.js';
+const UTILITY_PROCESS_REL = ['out', 'vs', 'code', 'electron-utility'];
+/** A utility process is in scope only when it owns an AiService HTTP/1.1 transport. */
+const TRANSPORT_FINGERPRINTS = ['aiserver.v1.AiService', 'HTTP/1.1 transport created'];
+/** ...and it is patchable only when VSCode's proxy-agent install site is inlined next to it. */
+const PROXY_AGENT_ANCHOR = 'proxy-agent patches installed';
 
 function parseSemver(v) {
   const [major = 0, minor = 0, patch = 0] = String(v || '0.0.0').split('.').map(n => Number(n) || 0);
@@ -49,14 +64,6 @@ function is1125OrNewer(version) {
   return v.patch >= 25;
 }
 
-export function getProxy39Target(paths) {
-  return paths.alwaysLocalSingletonJs || join(paths.appRoot, TARGET_REL);
-}
-
-export function needsProxy39Patch(paths) {
-  return is39OrNewer(paths.cursorVersion) && existsSync(getProxy39Target(paths));
-}
-
 function hasSyncPatch(code) {
   return code.includes(SYNC_CALL_MARKER);
 }
@@ -65,12 +72,122 @@ function hasRouterPatch(code) {
   return code.includes(ROUTER_MARKER);
 }
 
-export function isProxy39Patched(paths) {
-  const target = getProxy39Target(paths);
-  if (!existsSync(target)) return false;
-  const code = readFileSync(target, 'utf-8');
-  const syncOk = hasSyncPatch(code) || is1125OrNewer(paths.cursorVersion);
-  return hasRouterPatch(code) && syncOk;
+// ── 目标发现 ──
+
+/** Every *Main.js bundle under out/vs/code/electron-utility/, newest layout or not. */
+export function listUtilityProcessBundles(paths) {
+  const root = join(paths.appRoot, ...UTILITY_PROCESS_REL);
+  if (!existsSync(root)) return [];
+  const bundles = [];
+  for (const dir of readdirSync(root, { withFileTypes: true })) {
+    if (!dir.isDirectory()) continue;
+    const dirPath = join(root, dir.name);
+    for (const entry of readdirSync(dirPath, { withFileTypes: true })) {
+      if (entry.isFile() && entry.name.endsWith('.js')) bundles.push(join(dirPath, entry.name));
+    }
+  }
+  return bundles;
+}
+
+function hasTransport(source) {
+  return TRANSPORT_FINGERPRINTS.every(fingerprint => source.includes(fingerprint));
+}
+
+function isPatchable(source) {
+  return source.includes(PROXY_AGENT_ANCHOR)
+    && /from\s*["']http["']/.test(source)
+    && /from\s*["']https["']/.test(source);
+}
+
+/**
+ * Classify the utility processes of this install.
+ * @returns {{ targets: string[], unpatchable: string[] }}
+ *   targets    — carry the AiService transport and expose the proxy-agent anchor
+ *   unpatchable — carry the transport but no known insertion point
+ */
+function discoverTargets(paths) {
+  const targets = [];
+  const unpatchable = [];
+  for (const file of listUtilityProcessBundles(paths)) {
+    let source;
+    try { source = readFileSync(file, 'utf-8'); }
+    catch { continue; }
+    if (!hasTransport(source)) continue;
+    if (isPatchable(source)) targets.push(file);
+    else unpatchable.push(file);
+  }
+  return { targets, unpatchable };
+}
+
+/**
+ * Single source of truth for this patch's state, shared by install/status/check.
+ * @returns {{ state: 'unsupported'|'retired'|'unreachable'|'patched'|'missing',
+ *             required: boolean, patched: boolean, targets: string[],
+ *             unpatchable: string[], summary: string }}
+ */
+export function inspectProxy39Patch(paths) {
+  const base = { targets: [], unpatchable: [] };
+
+  if (!is39OrNewer(paths.cursorVersion)) {
+    return { ...base, state: 'unsupported', required: false, patched: true, summary: 'Cursor < 3.9, utility-process BYOK router not applicable' };
+  }
+
+  const { targets, unpatchable } = discoverTargets(paths);
+
+  if (targets.length === 0 && unpatchable.length === 0) {
+    return {
+      ...base,
+      state: 'retired',
+      required: false,
+      patched: true,
+      summary: 'No utility process owns an AiService HTTP/1.1 transport (3.19+); coverage is provided by the always-local and agent-host routers',
+    };
+  }
+
+  if (targets.length === 0) {
+    return {
+      targets, unpatchable,
+      state: 'unreachable',
+      required: true,
+      patched: false,
+      summary: `Utility-process AiService transport found without a known insertion point: ${unpatchable.map(shortName).join(', ')}`,
+    };
+  }
+
+  const nativeSync = is1125OrNewer(paths.cursorVersion);
+  const pending = targets.filter((file) => {
+    const code = readFileSync(file, 'utf-8');
+    return !(hasRouterPatch(code) && (hasSyncPatch(code) || nativeSync));
+  });
+
+  if (pending.length === 0) {
+    return {
+      targets, unpatchable,
+      state: 'patched',
+      required: true,
+      patched: true,
+      summary: `Utility-process BYOK router active in ${targets.map(shortName).join(', ')}`,
+    };
+  }
+
+  return {
+    targets, unpatchable,
+    state: 'missing',
+    required: true,
+    patched: false,
+    summary: `Utility-process BYOK router missing in ${pending.map(shortName).join(', ')}`,
+  };
+}
+
+function shortName(file) {
+  return file.split(/[\\/]/).pop();
+}
+
+/** Legacy path plus every discovered target, so uninstall/status cover both layouts. */
+export function getProxy39BackupTargets(paths) {
+  const legacy = paths.alwaysLocalSingletonJs || join(paths.appRoot, TARGET_REL);
+  const targets = discoverTargets(paths).targets;
+  return [...new Set(existsSync(legacy) ? [legacy, ...targets] : targets)];
 }
 
 // ── createRequire 定位 ──
@@ -109,7 +226,7 @@ function ensureSyncImport(source) {
   }
 
   if (!createRequireName) {
-    throw new Error('node:module createRequire import not found in alwaysLocalSingletonMain.js');
+    throw new Error('node:module createRequire import not found in utility-process bundle');
   }
 
   if (!targetMatch) {
@@ -140,18 +257,16 @@ function insertBeforeSyncCall(source, routerCall, fnName) {
   }
 
   const call = `${fnName}()`;
-  const phrase = '[AlwaysLocalSingleton] proxy-agent patches installed';
-  const anchor = source.indexOf(phrase);
-  if (anchor === -1) throw new Error('proxy-agent installed log anchor not found in alwaysLocalSingletonMain.js');
+  const anchor = source.indexOf(PROXY_AGENT_ANCHOR);
+  if (anchor === -1) throw new Error('proxy-agent installed log anchor not found in utility-process bundle');
   const callIdx = source.lastIndexOf(call, anchor);
   if (callIdx === -1) throw new Error('syncBuiltinESMExports call not found before proxy-agent log anchor');
   return source.slice(0, callIdx) + `${routerCall},${SYNC_CALL_MARKER}` + source.slice(callIdx);
 }
 
 function insertRouterOnly(source, routerCall) {
-  const phrase = '[AlwaysLocalSingleton] proxy-agent patches installed';
-  const idx = source.indexOf(phrase);
-  if (idx === -1) throw new Error('proxy-agent installed log anchor not found in alwaysLocalSingletonMain.js');
+  const idx = source.indexOf(PROXY_AGENT_ANCHOR);
+  if (idx === -1) throw new Error('proxy-agent installed log anchor not found in utility-process bundle');
 
   // 3.11.25+: pattern is `installFn(arg),syncFn(),logger.info("...")`
   // Find the `)` right before the `,logger.info(...)` — insert router after the proxy-agent install call
@@ -194,10 +309,9 @@ function insertPatches(source, fnName, createRequireName, nativeSync) {
   }
 
   // Fallback: anchor on the log string and insert after the immediately preceding call.
-  const phrase = '[AlwaysLocalSingleton] proxy-agent patches installed';
-  const anchorIdx = source.indexOf(phrase);
+  const anchorIdx = source.indexOf(PROXY_AGENT_ANCHOR);
   if (anchorIdx === -1) {
-    throw new Error('proxy-agent installed log anchor not found in alwaysLocalSingletonMain.js');
+    throw new Error('proxy-agent installed log anchor not found in utility-process bundle');
   }
 
   const start = Math.max(0, anchorIdx - 400);
@@ -212,100 +326,83 @@ function insertPatches(source, fnName, createRequireName, nativeSync) {
   return source.slice(0, insertAt) + patchCalls + source.slice(insertAt);
 }
 
+/** Produce the patched source for one utility-process bundle. */
+function buildPatchedSource(code, nativeSync) {
+  if (nativeSync) {
+    // 3.11.25+: sync is native, only the BYOK router is needed.
+    const createRequireName = findCreateRequireAlias(code);
+    if (!createRequireName) {
+      throw new Error('node:module createRequire import not found in utility-process bundle');
+    }
+    const patched = insertPatches(code, null, createRequireName, true);
+    if (!hasRouterPatch(patched)) throw new Error('insertion did not produce the router marker');
+    return patched;
+  }
+
+  const imported = ensureSyncImport(code);
+  const patched = insertPatches(imported.source, imported.fnName, imported.createRequireName, false);
+  if (!hasRouterPatch(patched) || !hasSyncPatch(patched)) {
+    throw new Error('insertion did not produce both the router and sync markers');
+  }
+  return patched;
+}
+
 // ── Public API ──
 
 export function patchProxy39(paths, log) {
-  if (!is39OrNewer(paths.cursorVersion)) {
-    log?.('[proxy-39] Cursor < 3.9, skipping');
+  const inspection = inspectProxy39Patch(paths);
+
+  if (inspection.state === 'unsupported' || inspection.state === 'retired' || inspection.state === 'patched') {
+    log?.(`[proxy-39] ${inspection.summary}, skipping`);
     return false;
   }
-
-  const target = getProxy39Target(paths);
-  if (!existsSync(target)) {
-    log?.('[proxy-39] alwaysLocalSingletonMain.js not found, skipping');
-    return false;
-  }
-
-  let code = readFileSync(target, 'utf-8');
-  if (isProxy39Patched(paths)) {
-    log?.('[proxy-39] Singleton BYOK router/proxy sync already applied');
-    return false;
-  }
-
-  // Only force this on the 3.9+ inline HTTP/1.1 transport shape.
-  if (!/from\s*["']https["']/.test(code) || !/from\s*["']http["']/.test(code) || !code.includes('proxy-agent patches installed')) {
-    log?.('[proxy-39] 3.9 inline HTTP/1.1 transport signature not found, skipping');
-    return false;
+  if (inspection.state === 'unreachable') {
+    throw new Error(`proxy-39: ${inspection.summary}`);
   }
 
   const nativeSync = is1125OrNewer(paths.cursorVersion);
+  log?.(`[proxy-39] Patching ${inspection.targets.length} utility process(es)${nativeSync ? ' (native syncBuiltinESMExports)' : ''}...`);
 
-  if (nativeSync) {
-    // 3.11.25+: only need the BYOK router, sync is native
-    log?.('[proxy-39] 3.11.25+ detected: native syncBuiltinESMExports, injecting router only...');
-    const createRequireName = findCreateRequireAlias(code);
-    if (!createRequireName) {
-      throw new Error('node:module createRequire import not found in alwaysLocalSingletonMain.js');
-    }
-    code = insertPatches(code, null, createRequireName, true);
-  } else {
-    log?.('[proxy-39] Patching singleton BYOK router + proxy sync...');
-    const imported = ensureSyncImport(code);
-    code = insertPatches(imported.source, imported.fnName, imported.createRequireName, false);
+  let modified = 0;
+  for (const target of inspection.targets) {
+    const code = readFileSync(target, 'utf-8');
+    const patched = buildPatchedSource(code, nativeSync);
+    if (patched === code) continue;
+    createBackup(target, TAG, log);
+    writeFileSync(target, patched);
+    updateChecksums(paths, [target], TAG, log);
+    modified++;
   }
 
-  if (!hasRouterPatch(code)) {
-    throw new Error('proxy-39 patch insertion failed verification (router)');
-  }
-  if (!nativeSync && !hasSyncPatch(code)) {
-    throw new Error('proxy-39 patch insertion failed verification (sync)');
-  }
-
-  createBackup(target, TAG, log);
-  writeFileSync(target, code);
-  updateChecksums(paths, [target], TAG, log);
-  log?.('[proxy-39] Done');
-  return true;
+  log?.(`[proxy-39] Done (${modified} file(s))`);
+  return modified > 0;
 }
 
 export function checkProxy39Patch(paths, log) {
-  if (!is39OrNewer(paths.cursorVersion)) {
-    log?.('  Cursor < 3.9, not required');
+  const inspection = inspectProxy39Patch(paths);
+
+  if (inspection.state === 'unsupported' || inspection.state === 'retired') {
+    log?.(`  ${inspection.summary}`);
+    return true;
+  }
+  if (inspection.state === 'unreachable') {
+    log?.(`  [FAIL] ${inspection.summary}`);
+    return false;
+  }
+  if (inspection.state === 'patched') {
+    log?.(`  ${inspection.summary}`);
     return true;
   }
 
-  const target = getProxy39Target(paths);
-  if (!existsSync(target)) {
-    log?.('  alwaysLocalSingletonMain.js not found');
-    return false;
-  }
-
-  const code = readFileSync(target, 'utf-8');
   const nativeSync = is1125OrNewer(paths.cursorVersion);
-
-  if (hasRouterPatch(code) && (hasSyncPatch(code) || nativeSync)) {
-    log?.('  Already patched');
-    return true;
-  }
-
-  try {
-    if (nativeSync) {
-      const createRequireName = findCreateRequireAlias(code);
-      if (!createRequireName) throw new Error('createRequire alias not found');
-      const patched = insertPatches(code, null, createRequireName, true);
-      if (!hasRouterPatch(patched)) throw new Error('dry-run did not produce router marker');
-      log?.('  [OK] 3.11.25+ singleton BYOK router insertion point found (native sync)');
-    } else {
-      const imported = ensureSyncImport(code);
-      const patched = insertPatches(imported.source, imported.fnName, imported.createRequireName, false);
-      if (!hasRouterPatch(patched) || !hasSyncPatch(patched)) {
-        throw new Error('dry-run insertion did not produce both router and sync markers');
-      }
-      log?.('  [OK] singleton BYOK router/proxy sync insertion point found');
+  for (const target of inspection.targets) {
+    try {
+      buildPatchedSource(readFileSync(target, 'utf-8'), nativeSync);
+      log?.(`  [OK] ${shortName(target)}: BYOK router insertion point found`);
+    } catch (e) {
+      log?.(`  [FAIL] ${shortName(target)}: ${e.message}`);
+      return false;
     }
-    return true;
-  } catch (e) {
-    log?.(`  [FAIL] ${e.message}`);
-    return false;
   }
+  return true;
 }

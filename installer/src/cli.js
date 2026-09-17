@@ -12,7 +12,7 @@ import { uninstall } from './uninstall.js';
 import { status } from './status.js';
 import { check } from './check.js';
 import { findCursorPathsDetailed, formatDiagnostic } from './detect.js';
-import { patchLocalMode } from './patch-local-mode.js';
+import { getLocalModeTargets, patchLocalMode } from './patch-local-mode.js';
 import { restoreBackup } from './backup.js';
 
 async function update() {
@@ -44,16 +44,8 @@ const commands = {
     info(`Cursor: ${paths.appRoot}`);
     info('Restoring local-mode patches...');
     let restored = 0;
-    const { join } = await import('path');
-    const targets = [
-      'out/main.js',
-      'out/vs/workbench/workbench.desktop.main.js',
-      'out/vs/workbench/workbench.glass.main.js',
-      'out/vs/workbench/api/node/extensionHostProcess.js',
-      'out/vs/code/electron-utility/alwaysLocalSingleton/alwaysLocalSingletonMain.js',
-    ];
-    for (const rel of targets) {
-      if (restoreBackup(join(paths.appRoot, rel), 'local-mode', info)) restored++;
+    for (const target of getLocalModeTargets(paths)) {
+      if (restoreBackup(target, 'local-mode', info)) restored++;
     }
     if (restoreBackup(paths.productJson, 'local-mode', info)) restored++;
     console.log(restored > 0 ? `\x1b[32m[OK]\x1b[0m Restored ${restored} file(s)` : '\x1b[33m[!]\x1b[0m No backups found');

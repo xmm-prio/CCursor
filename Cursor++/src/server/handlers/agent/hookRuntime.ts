@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto';
 import type { AgentServerMessage } from '../../gen/agent_v1_pb';
 import { execMessage } from './stream';
-import { waitForExecClientMessageWithHeartbeat } from './wait';
+import { releaseExec, waitForExecClientMessageWithHeartbeat } from './wait';
 import type { AgentSession } from './session';
 
 export async function* executePreCompactHook(params: {
@@ -38,6 +38,7 @@ export async function* executePreCompactHook(params: {
     });
 
     const response = yield* waitForExecClientMessageWithHeartbeat(params.session, params.execMessageId, 15_000);
+    releaseExec(params.session, params.execMessageId);
     const execClientMessage = response?.execClientMessage as Record<string, unknown> | undefined;
     const executeHookResult = execClientMessage?.executeHookResult as Record<string, unknown> | undefined;
     const hookResponse = executeHookResult?.response as Record<string, unknown> | undefined;

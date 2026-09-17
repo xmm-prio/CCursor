@@ -1,7 +1,7 @@
 import { create, toJson } from '@bufbuild/protobuf'
 import { describe, expect, it } from 'vitest'
 import { AgentClientMessageSchema } from '../gen/agent_v1_pb'
-import { createEphemeralSession, pushSessionMessage, waitForMessageMatching } from '../handlers/agent/session'
+import { createEphemeralSession, pushSessionMessage, waitForExecEventMatching } from '../handlers/agent/session'
 
 /**
  * steer 注入 (injectContextAction) 的丢弃。
@@ -38,9 +38,11 @@ describe('injectContextAction 的处理', () => {
     expect(session.messages).toHaveLength(0)
   })
 
-  it('不干扰同一队列上的 exec 结果等待', async () => {
+  it('不干扰同时进行的 exec 结果等待', async () => {
+    // exec 消息走 per-exec 通道 (execChannels.ts),不再与注入消息共享队列;
+    // 这里验证被丢弃的注入不会让 exec 等待者空等。
     const session = createEphemeralSession('steer-2')
-    const pending = waitForMessageMatching(session, msg => 'execClientMessage' in msg, 1000)
+    const pending = waitForExecEventMatching(session, 1, msg => 'execClientMessage' in msg, 1000)
 
     pushSessionMessage(session, injectMessage('inj-3'))
     pushSessionMessage(session, { execClientMessage: { id: 1, readResult: {} } })

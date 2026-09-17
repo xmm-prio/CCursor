@@ -83,4 +83,9 @@ export const CreatePlanTool: ToolRegistryEntry = {
         ...(typeof input.is_project === 'boolean' ? { isProject: input.is_project } : {}),
         ...(Array.isArray(input.phases) ? { phases: input.phases } : {}),
     }),
+    interaction: {
+        queryCase: 'createPlanRequestQuery',
+        responseCase: 'createPlanRequestResponse',
+        buildQueryValue: (startedArgs, callId) => ({ args: startedArgs, toolCallId: callId }),
+    },
 };

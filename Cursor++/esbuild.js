@@ -63,7 +63,10 @@ const esbuildProblemMatcherPlugin = {
 async function main() {
   // ── Context 1: Extension host (Node.js) ──
   const extCtx = await esbuild.context({
-    entryPoints: ["src/extension.ts"],
+    // extension.ts  → the `ui` control identity (cursor2plus)
+    // extension-remote.ts → the headless `workspace` companion installed on a
+    //   Remote SSH host so its extension hosts reach a BYOK server locally
+    entryPoints: ["src/extension.ts", "src/extension-remote.ts"],
     bundle: true,
     format: "cjs",
     minify: production,

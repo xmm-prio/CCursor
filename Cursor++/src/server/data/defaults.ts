@@ -16,6 +16,28 @@ export const DEFAULT_PORT = 39831
 export const DEFAULT_COLLECTOR_PORT = 14800
 
 /**
+ * How many consecutive ports starting at server.port may be claimed.
+ *
+ * The extension walks the span upwards when the preferred port is taken, and
+ * the renderer hook walks the very same span when probing for the server, so
+ * a shifted server stays discoverable without re-running the installer.
+ */
+export const PORT_FALLBACK_SPAN = 8
+
+/**
+ * SSE event names on /byok/events.
+ *
+ * `routes` carries the legacy payload (a bare array of REST paths) and exists
+ * only for renderer hooks injected by an older installer. `routes-v2` carries
+ * the full RoutesPayload (endpoint + REST + ConnectRPC whitelist) and is the
+ * channel every current consumer subscribes to. Both are emitted on every
+ * update, so old and new hooks can share one server.
+ */
+export const SSE_EVENT_ROUTES_LEGACY = 'routes'
+export const SSE_EVENT_ROUTES = 'routes-v2'
+export const ROUTES_PAYLOAD_VERSION = 2
+
+/**
  * BASE_REDIRECT —— 不论 BYOK 开关如何,**永远**生效的劫持白名单。
  *
  * 当前只包含"假装订阅"的 2 个 Stripe profile stub。
@@ -110,7 +132,12 @@ export type ByokMode = 0 | 1
 export interface RoutesConfig {
   $schemaVersion: number
   byokMode: ByokMode
-  server: { host: string, port: number }
+  /**
+   * `externalUrl` is only set when the extension host runs on a remote machine
+   * (Remote SSH / WSL / containers) and vscode.env.asExternalUri produced an
+   * address that differs from the local one. Absent in every local setup.
+   */
+  server: { host: string, port: number, externalUrl?: string }
   collector: { host: string, port: number }
   redirect: string[]
 }

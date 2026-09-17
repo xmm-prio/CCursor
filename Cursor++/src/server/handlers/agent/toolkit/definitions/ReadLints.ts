@@ -69,6 +69,7 @@ export const ReadLintsTool: ToolRegistryEntry = {
     aliases: ["ReadLints"],
     cursorToolType: 'readLintsToolCall',
     execArgsType: 'diagnosticsArgs',
+    conciseStaticContext: 'Check for linter errors after substantive edits.',
     llmToolByProvider: {
         anthropic: ANTHROPIC,
         openai: OPENAI,
