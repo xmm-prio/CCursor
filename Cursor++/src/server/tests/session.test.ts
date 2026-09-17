@@ -2,9 +2,8 @@ import { expect, it } from 'vitest'
 import { createEphemeralSession, pushSessionMessage, waitForInteractionResponse } from '../handlers/agent/session'
 import {
   AgentRunAbortedError,
-  waitForExecClientMessageWithHeartbeat,
-  waitForExecStreamCloseWithHeartbeat,
-  waitForPromiseWithHeartbeat,
+  waitForExecClientMessage,
+  waitForExecStreamClose,
 } from '../handlers/agent/wait'
 
 it('waitForInteractionResponse resolves when interaction response is pushed into session', async () => {
@@ -66,29 +65,8 @@ it('waitForInteractionResponse without timeout resolves after delayed response',
   expect('askQuestionInteractionResponse' in interaction).toBeTruthy()
 })
 
-it('waitForPromiseWithHeartbeat yields heartbeat frames before resolving', async () => {
-  const iterator = waitForPromiseWithHeartbeat(new Promise<string>((resolve) => {
-    setTimeout(resolve, 15, 'done')
-  }), 5)
-
-  const first = await iterator.next()
-  expect(first.done).toBe(false)
-  if (first.done)
-    throw new Error('unexpected done')
-  expect(first.value.message.case).toBe('interactionUpdate')
-  if (first.value.message.case !== 'interactionUpdate')
-    throw new Error('unexpected case')
-  expect(first.value.message.value.message.case).toBe('heartbeat')
-
-  let final = await iterator.next()
-  while (!final.done) {
-    final = await iterator.next()
-  }
-  expect(final.value).toBe('done')
-})
-
-it('waitForExecClientMessageWithHeartbeat returns matching exec client message', async () => {
-  const session = createEphemeralSession('exec-heartbeat')
+it('waitForExecClientMessage returns matching exec client message', async () => {
+  const session = createEphemeralSession('exec-wait')
   setTimeout(() => {
     pushSessionMessage(session, {
       execClientMessage: {
@@ -103,18 +81,14 @@ it('waitForExecClientMessageWithHeartbeat returns matching exec client message',
     })
   }, 10)
 
-  const iterator = waitForExecClientMessageWithHeartbeat(session, 12, null, 5)
-  let final = await iterator.next()
-  while (!final.done) {
-    final = await iterator.next()
-  }
+  const result = await waitForExecClientMessage(session, 12, null)
 
-  expect(final.value).toBeTruthy()
-  expect(!!(final.value as Record<string, unknown>).execClientMessage).toBe(true)
+  expect(result).toBeTruthy()
+  expect(!!(result as Record<string, unknown>).execClientMessage).toBe(true)
 })
 
-it('waitForExecStreamCloseWithHeartbeat returns matching stream close control message', async () => {
-  const session = createEphemeralSession('exec-close-heartbeat')
+it('waitForExecStreamClose returns matching stream close control message', async () => {
+  const session = createEphemeralSession('exec-close-wait')
   setTimeout(() => {
     pushSessionMessage(session, {
       execClientControlMessage: {
@@ -125,18 +99,14 @@ it('waitForExecStreamCloseWithHeartbeat returns matching stream close control me
     })
   }, 10)
 
-  const iterator = waitForExecStreamCloseWithHeartbeat(session, 13, null, 5)
-  let final = await iterator.next()
-  while (!final.done) {
-    final = await iterator.next()
-  }
+  const result = await waitForExecStreamClose(session, 13, null)
 
-  expect(final.value).toBeTruthy()
-  expect((((final.value as Record<string, unknown>).execClientControlMessage as Record<string, unknown>).streamClose as Record<string, unknown>).id).toBe(13)
+  expect(result).toBeTruthy()
+  expect((((result as Record<string, unknown>).execClientControlMessage as Record<string, unknown>).streamClose as Record<string, unknown>).id).toBe(13)
 })
 
-it('waitForExecClientMessageWithHeartbeat throws AgentRunAbortedError on execClientControlMessage.throw', async () => {
-  const session = createEphemeralSession('exec-throw-heartbeat')
+it('waitForExecClientMessage throws AgentRunAbortedError on execClientControlMessage.throw', async () => {
+  const session = createEphemeralSession('exec-throw-wait')
   setTimeout(() => {
     pushSessionMessage(session, {
       execClientControlMessage: {
@@ -149,12 +119,8 @@ it('waitForExecClientMessageWithHeartbeat throws AgentRunAbortedError on execCli
     })
   }, 10)
 
-  const iterator = waitForExecClientMessageWithHeartbeat(session, 14, null, 5)
   try {
-    let final = await iterator.next()
-    while (!final.done) {
-      final = await iterator.next()
-    }
+    await waitForExecClientMessage(session, 14, null)
     expect.unreachable('should have thrown')
   }
   catch (error) {

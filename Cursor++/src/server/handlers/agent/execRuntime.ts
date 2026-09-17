@@ -17,9 +17,9 @@ import type { ReadContextState } from './contextCatalog';
 import {
     isAgentRunAbortedError,
     releaseExec,
-    waitForExecClientMessageWithHeartbeat,
-    waitForExecStreamCloseWithHeartbeat,
-    waitForShellExecEventWithHeartbeat,
+    waitForExecClientMessage,
+    waitForExecStreamClose,
+    waitForShellExecEvent,
 } from './wait';
 
 /**
@@ -219,7 +219,7 @@ async function* runExecToCompletion(
 
         logger.info({ tool: params.toolName, callId: params.callId }, '[TOOL] waiting for shell approval/execution start');
         while (terminalState === null && streamFailure === undefined) {
-            const shellMsg = yield* waitForShellExecEventWithHeartbeat(params.session, params.execMessageId, null);
+            const shellMsg = await waitForShellExecEvent(params.session, params.execMessageId, null);
             if (!shellMsg) {
                 // Cancellation surfaces as AgentRunAbortedError from the waiter, so a null
                 // here is a dropped/timed-out stream, not a user interrupt.
@@ -275,7 +275,7 @@ async function* runExecToCompletion(
             execTime: localExecTime,
         }, '[TOOL] shell exec completed');
     } else {
-        const execResult = yield* waitForExecClientMessageWithHeartbeat(
+        const execResult = await waitForExecClientMessage(
             params.session,
             params.execMessageId,
             null,
@@ -318,7 +318,7 @@ async function* runExecToCompletion(
             }, '[TOOL] exec ended without result');
         }
 
-        yield* waitForExecStreamCloseWithHeartbeat(
+        await waitForExecStreamClose(
             params.session,
             params.execMessageId,
             null,

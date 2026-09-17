@@ -18,8 +18,10 @@ export default (router: ConnectRouter) => {
         bidiAppend: async (req) => {
             const requestId = req.requestId?.requestId;
             if (requestId && req.data) {
-                logger.info({ requestId, dataLen: req.data.length, seqno: Number(req.appendSeqno) }, '[SVC] BidiAppend');
-                appendMessage(requestId, req.data);
+                // debug, not info: a chatty shell streams hundreds of appends per turn,
+                // and every one of them would otherwise be pushed to the window SSE log.
+                logger.debug({ requestId, dataLen: req.data.length, seqno: Number(req.appendSeqno) }, '[SVC] BidiAppend');
+                appendMessage(requestId, req.data, req.appendSeqno);
             } else {
                 logger.warn({ hasRequestId: !!requestId, hasData: !!req.data }, '[SVC] BidiAppend missing fields');
             }

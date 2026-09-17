@@ -1,8 +1,5 @@
-import type { AgentServerMessage } from '../../gen/agent_v1_pb';
-import { AGENT_HEARTBEAT_INTERVAL_MS } from './constants';
 import { closeExecChannel } from './execChannels';
-import { waitForExecEventMatching, waitForInteractionResponse, waitForMessageMatching, type AgentSession } from './session';
-import { heartbeat } from './stream';
+import { waitForExecEventMatching, type AgentSession } from './session';
 
 export class AgentRunAbortedError extends Error {
     readonly execMessageId?: number;
@@ -18,6 +15,31 @@ export class AgentRunAbortedError extends Error {
 
 export function isAgentRunAbortedError(error: unknown): error is AgentRunAbortedError {
     return error instanceof AgentRunAbortedError;
+}
+
+/**
+ * A client message this exec was waiting for is provably gone (see linkHealth.ts).
+ *
+ * Distinct from AgentRunAbortedError on purpose: an abort is the client saying "stop",
+ * and the run ends quietly; a lost uplink is a transport failure the user can recover
+ * from by retrying, so it has to travel up to AgentService and become a retryable
+ * ConnectError with a banner.
+ */
+export class ExecLinkLostError extends Error {
+    readonly execMessageId: number;
+
+    constructor(execMessageId: number) {
+        super(
+            `the client message for exec ${execMessageId} was lost in transit `
+            + '(a gap in the BidiAppend sequence was never filled)',
+        );
+        this.name = 'ExecLinkLostError';
+        this.execMessageId = execMessageId;
+    }
+}
+
+export function isExecLinkLostError(error: unknown): error is ExecLinkLostError {
+    return error instanceof ExecLinkLostError;
 }
 
 /**
@@ -75,18 +97,22 @@ export async function waitForExecMessageMatching(
     predicate: (msg: Record<string, unknown>) => boolean,
     timeoutMs: number | null,
 ): Promise<Record<string, unknown> | null> {
-    const msg = await waitForExecEventMatching(
+    const outcome = await waitForExecEventMatching(
         session,
         execMessageId,
         (candidate) => predicate(candidate) || !!getExecThrowForId(candidate, execMessageId),
         timeoutMs,
     );
-    // 客户端中断 (cancelAction) 会让 waitForMessageMatching 立即返回 null。
+    // 客户端中断 (cancelAction) 会让等待立即结束。
     // 转成 AgentRunAbortedError,与 exec throw 走同一条干净收尾路径 ——
     // 否则工具会拿着 null 结果继续往下跑。
     throwIfSessionCancelled(session);
-    if (!msg) return null;
+    // A lost uplink must not look like "the tool returned nothing": that would be written
+    // into the transcript as a real (empty) result and the model would carry on.
+    if (outcome.kind === 'linkLost') throw new ExecLinkLostError(execMessageId);
+    if (outcome.kind === 'ended') return null;
 
+    const msg = outcome.event;
     const execThrow = getExecThrowForId(msg, execMessageId);
     if (execThrow) {
         throw buildExecAbortError(execThrow, execMessageId);
@@ -94,105 +120,51 @@ export async function waitForExecMessageMatching(
     return msg;
 }
 
-function delay(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
-
 /**
- * 在等待 Promise 期间持续 yield heartbeat，防止 Cursor stall detector 误判连接断开。
+ * Wait for this exec's result message.
  *
- * 返回值通过 async generator 的 return value 传递，便于调用方使用 `yield*` 获取结果：
- *   const response = yield* waitForPromiseWithHeartbeat(promise)
+ * Callers used to wrap every one of these in a heartbeat-emitting generator. Keeping the
+ * connection alive is now the turn envelope's job (turnKeepAlive.ts), so these are plain
+ * promises again and the call sites are plain `await`s.
  */
-export async function* waitForPromiseWithHeartbeat<T>(
-    promise: Promise<T>,
-    intervalMs = AGENT_HEARTBEAT_INTERVAL_MS,
-): AsyncGenerator<AgentServerMessage, T, void> {
-    let settled = false;
-    let result: T;
-    let failure: unknown;
-
-    const wrapped = promise.then(
-        (value) => {
-            settled = true;
-            result = value;
-        },
-        (error) => {
-            settled = true;
-            failure = error;
-        },
-    );
-
-    while (!settled) {
-        const raced = await Promise.race([
-            wrapped.then(() => 'done' as const),
-            delay(intervalMs).then(() => 'tick' as const),
-        ]);
-        if (raced === 'tick' && !settled) {
-            yield heartbeat();
-        }
-    }
-
-    if (failure !== undefined) throw failure;
-    return result!;
-}
-
-export async function* waitForMessageMatchingWithHeartbeat(
-    session: AgentSession,
-    predicate: (msg: Record<string, unknown>) => boolean,
-    timeoutMs: number | null = null,
-    intervalMs = AGENT_HEARTBEAT_INTERVAL_MS,
-): AsyncGenerator<AgentServerMessage, Record<string, unknown> | null, void> {
-    return yield* waitForPromiseWithHeartbeat(
-        waitForMessageMatching(session, predicate, timeoutMs),
-        intervalMs,
-    );
-}
-
-export async function* waitForInteractionResponseWithHeartbeat(
-    session: AgentSession,
-    id: number,
-    expectedCase: string,
-    timeoutMs: number | null = null,
-    intervalMs = AGENT_HEARTBEAT_INTERVAL_MS,
-): AsyncGenerator<AgentServerMessage, Record<string, unknown> | null, void> {
-    return yield* waitForPromiseWithHeartbeat(
-        waitForInteractionResponse(session, id, expectedCase, timeoutMs),
-        intervalMs,
-    );
-}
-
-export async function* waitForExecClientMessageWithHeartbeat(
+export function waitForExecClientMessage(
     session: AgentSession,
     execMessageId: number,
     timeoutMs: number | null = null,
-    intervalMs = AGENT_HEARTBEAT_INTERVAL_MS,
-): AsyncGenerator<AgentServerMessage, Record<string, unknown> | null, void> {
-    return yield* waitForPromiseWithHeartbeat(
-        waitForExecMessageMatching(
-            session,
-            execMessageId,
-            (msg) => isExecClientMessageForId(msg, execMessageId),
-            timeoutMs,
-        ),
-        intervalMs,
+): Promise<Record<string, unknown> | null> {
+    return waitForExecMessageMatching(
+        session,
+        execMessageId,
+        (msg) => isExecClientMessageForId(msg, execMessageId),
+        timeoutMs,
     );
 }
 
-export async function* waitForExecStreamCloseWithHeartbeat(
+/** 等待 exec 的 streamClose 控制消息。 */
+export function waitForExecStreamClose(
     session: AgentSession,
     execMessageId: number,
     timeoutMs: number | null = null,
-    intervalMs = AGENT_HEARTBEAT_INTERVAL_MS,
-): AsyncGenerator<AgentServerMessage, Record<string, unknown> | null, void> {
-    return yield* waitForPromiseWithHeartbeat(
-        waitForExecMessageMatching(
-            session,
-            execMessageId,
-            (msg) => isExecStreamCloseForId(msg, execMessageId),
-            timeoutMs,
-        ),
-        intervalMs,
+): Promise<Record<string, unknown> | null> {
+    return waitForExecMessageMatching(
+        session,
+        execMessageId,
+        (msg) => isExecStreamCloseForId(msg, execMessageId),
+        timeoutMs,
+    );
+}
+
+/** 等待 shell exec 的下一个事件 —— 结果或流关闭,先到者返回。 */
+export function waitForShellExecEvent(
+    session: AgentSession,
+    execMessageId: number,
+    timeoutMs: number | null = null,
+): Promise<Record<string, unknown> | null> {
+    return waitForExecMessageMatching(
+        session,
+        execMessageId,
+        (msg) => isExecClientMessageForId(msg, execMessageId) || isExecStreamCloseForId(msg, execMessageId),
+        timeoutMs,
     );
 }
 
@@ -219,21 +191,4 @@ export async function awaitExecResultAndClose(
     } finally {
         releaseExec(session, execMessageId);
     }
-}
-
-export async function* waitForShellExecEventWithHeartbeat(
-    session: AgentSession,
-    execMessageId: number,
-    timeoutMs: number | null = null,
-    intervalMs = AGENT_HEARTBEAT_INTERVAL_MS,
-): AsyncGenerator<AgentServerMessage, Record<string, unknown> | null, void> {
-    return yield* waitForPromiseWithHeartbeat(
-        waitForExecMessageMatching(
-            session,
-            execMessageId,
-            (msg) => isExecClientMessageForId(msg, execMessageId) || isExecStreamCloseForId(msg, execMessageId),
-            timeoutMs,
-        ),
-        intervalMs,
-    );
 }

@@ -13,6 +13,8 @@ import { ensureProvidersFile } from './config/providersStore'
 import { buildRoutesPayload, serializeRoutesFrames } from './config/routesPayload'
 import { ensureRoutesFile, loadRoutes, toggleByokMode } from './config/routesStore'
 import { closeAgentDatabase, initDatabase } from './database/sqlite'
+import { agentLinkDiagnostics } from './handlers/agent/session'
+import { streamRestartCount } from './handlers/agent/stream'
 import { enterWindowContext, logger, setLogBroadcast, setLogPush, setLogSubscriberCheck } from './logger'
 import { initRuntimeConfig } from './runtime-config'
 import routes from './services'
@@ -23,6 +25,8 @@ const RE_CONNECT_RPC_PATH = /\/([^/]+)\/(\w+)$/
  * 高频轮询端点 — 固定走 trace 级别 (默认不可见)。
  *
  * - /auth/full_stripe_profile, /auth/stripe_profile: Cursor 订阅状态轮询
+ * - /aiserver.v1.BidiService/BidiAppend: agent 上行通道, chatty shell 下
+ *   每个输出 chunk 都是一次 append, 按 debug 记会淹掉整个 Output 面板
  *
  * 节流机制已移除: trace 级别默认被 LogOutputChannel 过滤掉,
  * 开启 trace 时用户自己需要面对所有细节, 不再聚合汇总。
@@ -30,6 +34,7 @@ const RE_CONNECT_RPC_PATH = /\/([^/]+)\/(\w+)$/
 const TRACE_PATHS = new Set([
   '/auth/full_stripe_profile',
   '/auth/stripe_profile',
+  '/aiserver.v1.BidiService/BidiAppend',
 ])
 
 let app: any = null
@@ -247,13 +252,17 @@ export async function startServer(opts: StartServerOptions): Promise<{ host: str
 
   // ── SSE 日志流 + 窗口注册 ──
 
-  // 诊断端点 — 查看 SSE 连接状态 (log-stream per-window + events 广播)
+  // 诊断端点 — SSE 连接状态 (log-stream per-window + events 广播) + agent 链路健康
   server.get('/byok/debug', async () => ({
     logStreams: Array.from(logStreams.entries()).map(([wid, set]) => ({
       windowId: wid,
       connections: set.size,
     })),
     refreshEventConnections: refreshEventStreams.size,
+    agentLink: {
+      ...agentLinkDiagnostics(),
+      streamRestarts: streamRestartCount(),
+    },
   }))
 
   // SSE 公共头 — reply.raw.writeHead 绕过 Fastify 管道,

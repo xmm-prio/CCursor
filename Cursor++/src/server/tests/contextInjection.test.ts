@@ -48,8 +48,8 @@ describe('injectContextAction 的处理', () => {
     pushSessionMessage(session, { execClientMessage: { id: 1, readResult: {} } })
 
     const got = await pending
-    expect(got).toBeTruthy()
-    expect('execClientMessage' in (got as Record<string, unknown>)).toBe(true)
+    expect(got.kind).toBe('event')
+    expect('execClientMessage' in (got as { event: Record<string, unknown> }).event).toBe(true)
   })
 
   it('普通 conversationAction 不受影响', () => {

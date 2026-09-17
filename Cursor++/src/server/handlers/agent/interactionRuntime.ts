@@ -1,8 +1,7 @@
 import type { AgentServerMessage } from '../../gen/agent_v1_pb';
-import type { AgentSession } from './session';
+import { waitForInteractionResponse, type AgentSession } from './session';
 import { interactionQuery } from './stream';
 import { finalizeToolCall } from './toolLifecycle';
-import { waitForInteractionResponseWithHeartbeat } from './wait';
 import type { ToolResultEnvelope } from './toolResults';
 import type { ProviderRoundContext } from '../llm/providerRuntime';
 import type { LLMMessage } from '../llm/types';
@@ -33,7 +32,7 @@ export async function* finalizeInteractionTool(params: {
         && typeof params.expectedResponseCase === 'string'
     ) {
         yield interactionQuery(params.interactionId, params.queryCase, params.queryValue);
-        const response = yield* waitForInteractionResponseWithHeartbeat(
+        const response = await waitForInteractionResponse(
             params.session,
             params.interactionId,
             params.expectedResponseCase,

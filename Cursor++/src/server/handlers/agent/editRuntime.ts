@@ -24,8 +24,8 @@ import { finalizeToolCall } from './toolLifecycle';
 import type { AgentSession } from './session';
 import {
     releaseExec,
-    waitForExecClientMessageWithHeartbeat,
-    waitForExecStreamCloseWithHeartbeat,
+    waitForExecClientMessage,
+    waitForExecStreamClose,
 } from './wait';
 import type { EditPlan } from './toolkit/editPlans';
 import { applyStringEditToContent } from './toolkit/definitions/Edit';
@@ -287,8 +287,8 @@ export async function* finalizeEditToolCall(params: {
 
     const readExecMsgId = params.allocateExecMessageId();
     yield execMessage(readExecMsgId, `${callId}-read`, 'readArgs', { path, toolCallId: callId });
-    const readFrame = yield* waitForExecClientMessageWithHeartbeat(params.session, readExecMsgId, null);
-    yield* waitForExecStreamCloseWithHeartbeat(params.session, readExecMsgId, null);
+    const readFrame = await waitForExecClientMessage(params.session, readExecMsgId, null);
+    await waitForExecStreamClose(params.session, readExecMsgId, null);
     releaseExec(params.session, readExecMsgId);
     yield heartbeat();
 
@@ -341,8 +341,8 @@ export async function* finalizeEditToolCall(params: {
         toolCallId: callId,
         ...(plan.kind === 'editNotebook' ? { returnFileContentAfterWrite: true, fileBytes: new Uint8Array() } : {}),
     });
-    const writeFrame = yield* waitForExecClientMessageWithHeartbeat(params.session, writeExecMsgId, null);
-    yield* waitForExecStreamCloseWithHeartbeat(params.session, writeExecMsgId, null);
+    const writeFrame = await waitForExecClientMessage(params.session, writeExecMsgId, null);
+    await waitForExecStreamClose(params.session, writeExecMsgId, null);
     releaseExec(params.session, writeExecMsgId);
 
     const writeError = extractWriteError(writeFrame);

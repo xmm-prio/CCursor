@@ -18,7 +18,7 @@ import { checkpoint, editToolCallStreamDelta, heartbeat, kvMessage, partialToolC
 import { buildSummaryUserMessage, SUMMARY_SYSTEM_PROMPT } from './summaryPrompt'
 import { finalizeTaskResult, launchTaskTool, runToolCall, type TaskLaunchContext } from './toolRuntime'
 import { abortInFlightExecs } from './execRuntime'
-import { awaitExecResultAndClose, waitForPromiseWithHeartbeat } from './wait'
+import { awaitExecResultAndClose } from './wait'
 import { restoreBlobMessageToLLMMessage } from './transcript'
 import { ActiveTurnTracker, createCurrentTurnUserMessageBlob, readTurnBaseline } from './turnTracker'
 import { contextualizeDynamicMetaTools, partitionCursorBuiltinTools, shouldEnableBuiltinDynamicProfile } from './dynamicTools'
@@ -1211,7 +1211,7 @@ export async function* handleConversationRun(
             usedTokensEstimate = Math.max(usedTokensEstimate, estimateContextTokens(event.usage))
             break
         }
-      }, undefined, (event) => {
+      }, (event) => {
         if (event.type === 'tool_use_start')
           return `${parsed.conversationId}-${round}-${event.id.slice(-4)}`
       })
@@ -1346,7 +1346,7 @@ export async function* handleConversationRun(
         const resultPromises = taskLaunches.map(ctx =>
           awaitExecResultAndClose(session, ctx.execMessageId),
         )
-        const results = yield* waitForPromiseWithHeartbeat(Promise.all(resultPromises))
+        const results = await Promise.all(resultPromises)
         for (let i = 0; i < taskLaunches.length; i++) {
           const frame = finalizeTaskResult(taskLaunches[i], results[i], roundContext, messages, session)
           const completedToolCall = extractCompletedToolCall(frame)

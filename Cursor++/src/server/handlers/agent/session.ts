@@ -20,6 +20,15 @@ import {
     takeExecEvent,
     type ExecChannel,
 } from './execChannels';
+import {
+    createLinkHealth,
+    isLinkLost,
+    linkHealthSnapshot,
+    msUntilLinkLoss,
+    observeAppend,
+    reportLinkLoss,
+    type LinkHealth,
+} from './linkHealth';
 
 /**
  * 后台 job 登记项。
@@ -56,6 +65,11 @@ export interface AgentSession {
      * bounded stream of events.
      */
     execChannels: Map<number, ExecChannel>;
+    /**
+     * Continuity tracking of the BidiAppend uplink (see linkHealth.ts). Drives the only
+     * escape hatch out of an otherwise unbounded wait.
+     */
+    linkHealth: LinkHealth;
     /** @deprecated 保留向后兼容，新代码使用 listeners */
     notify: (() => void) | null;
     listeners: Set<() => void>;
@@ -87,6 +101,7 @@ export function createEphemeralSession(requestId: string): AgentSession {
         requestId,
         messages: [],
         execChannels: createExecChannelRegistry(),
+        linkHealth: createLinkHealth(),
         notify: null,
         listeners: new Set(),
         closed: false,
@@ -218,6 +233,9 @@ const sessions = new Map<string, SessionEntry>();
 
 let leaseCounter = 0;
 
+/** RunSSE streams that had to take a requestId away from a still-running stream. */
+let reclaimCount = 0;
+
 /**
  * Ownership handle a RunSSE stream holds over its requestId.
  *
@@ -281,6 +299,7 @@ export function claimSession(requestId: string): SessionLease {
         session = previous.session;
     }
     else {
+        reclaimCount++;
         session = createEphemeralSession(requestId);
         session.messages = previous.session.messages.splice(0);
         session.terminalsFolder = previous.session.terminalsFolder;
@@ -309,9 +328,17 @@ export function claimSession(requestId: string): SessionLease {
     };
 }
 
-/** BidiAppend 调用时，将消息推入 session 队列 */
-export function appendMessage(requestId: string, data: string): void {
+/**
+ * BidiAppend 调用时，将消息推入 session 队列。
+ *
+ * `seqno` is the transport's own numbering of this append; it is fed to the link health
+ * tracker before ingestion so that a waiter woken by this message already sees an
+ * up-to-date view of the uplink. Pass it through verbatim — linkHealth.ts decides on its
+ * own whether the numbering is trustworthy.
+ */
+export function appendMessage(requestId: string, data: string, seqno?: number | bigint): void {
     const session = getOrCreateSession(requestId);
+    observeAppend(session, seqno);
 
     // data 是 proto string 类型，实际承载的是 protobuf binary 的 hex 字符串表示。
     // "0ad88200a00012..." → hex decode → protobuf bytes
@@ -320,7 +347,7 @@ export function appendMessage(requestId: string, data: string): void {
         const clientMsg = fromBinary(AgentClientMessageSchema, bytes);
         const json = toJson(AgentClientMessageSchema, clientMsg) as Record<string, unknown>;
         const keys = Object.keys(json);
-        logger.info({ requestId, keys, protoBytes: bytes.length }, '[SESSION] appendMessage');
+        logger.debug({ requestId, keys, protoBytes: bytes.length }, '[SESSION] appendMessage');
         ingestSessionMessage(session, json);
     } catch (e) {
         logger.warn({ requestId, dataLen: data.length, error: (e as Error).message }, '[SESSION] proto decode failed');
@@ -347,25 +374,40 @@ export async function waitForMessageMatching(
     predicate: (msg: Record<string, unknown>) => boolean,
     timeoutMs: number | null = 30_000,
 ): Promise<Record<string, unknown> | null> {
-    return waitForEvent(session, () => {
+    const outcome = await waitForEvent(session, () => {
         const idx = session.messages.findIndex(predicate);
         return idx >= 0 ? session.messages.splice(idx, 1)[0] : null;
     }, timeoutMs);
+    return outcome.kind === 'event' ? outcome.event : null;
 }
+
+/**
+ * How a park on the session ended.
+ *
+ * `ended` folds together close / cancel / timeout — three ways of saying "no event is
+ * coming", all of which the callers already handle identically. `linkLost` is kept apart
+ * because it is the one outcome that must not be silently absorbed: it means a client
+ * message was dropped in transit, and the run has to surface a retryable error rather
+ * than pretend the tool returned nothing.
+ */
+export type WaitOutcome =
+    | { kind: 'event'; event: Record<string, unknown> }
+    | { kind: 'ended' }
+    | { kind: 'linkLost' };
 
 /**
  * Wait for an event of a single exec, consumed from that exec's own channel.
  *
- * Same contract as waitForMessageMatching (null on close / cancel / timeout), but the
- * search space is one exec's buffer instead of the shared queue, so two concurrently
- * running execs can never consume each other's events.
+ * Same parking semantics as waitForMessageMatching, but the search space is one exec's
+ * buffer instead of the shared queue (so two concurrently running execs can never consume
+ * each other's events), and the outcome is reported in full rather than collapsed to null.
  */
 export async function waitForExecEventMatching(
     session: AgentSession,
     execMessageId: number,
     predicate: (msg: Record<string, unknown>) => boolean,
     timeoutMs: number | null = 30_000,
-): Promise<Record<string, unknown> | null> {
+): Promise<WaitOutcome> {
     acquireExecWaiter(session, execMessageId);
     try {
         return await waitForEvent(
@@ -381,31 +423,44 @@ export async function waitForExecEventMatching(
 
 /**
  * Shared wait primitive: park on the session's listener set until `take` yields an
- * event, the session ends (closed / cancelled), or the timeout elapses.
+ * event, the session ends (closed / cancelled), the timeout elapses, or the uplink is
+ * ruled lost.
  *
  * `take` owns where the event comes from and removes it from its buffer; this function
  * owns only the parking and wake-up.
+ *
+ * The link-loss arm is the reason an unbounded wait is now safe. It is armed off
+ * linkHealth's deadline rather than off a wall-clock budget of its own, so a wait only
+ * ever ends early when there is positive evidence (a seqno gap that survived both grace
+ * windows) that the message it is waiting for will never arrive.
  */
 function waitForEvent(
     session: AgentSession,
     take: () => Record<string, unknown> | null,
     timeoutMs: number | null,
     logContext: Record<string, unknown> = {},
-): Promise<Record<string, unknown> | null> {
+): Promise<WaitOutcome> {
     // 先检查缓冲里是否已有匹配消息
     const buffered = take();
-    if (buffered) return Promise.resolve(buffered);
+    if (buffered) return Promise.resolve({ kind: 'event', event: buffered });
     // cancelled 与 closed 同样立即结束等待 —— 调用方 (wait.ts) 据
     // session.cancelledReason 区分二者,把前者转成 AgentRunAbortedError
-    if (session.closed || session.cancelledReason !== undefined) return Promise.resolve(null);
+    if (session.closed || session.cancelledReason !== undefined) return Promise.resolve({ kind: 'ended' });
+    if (isLinkLost(session.linkHealth)) {
+        reportLinkLoss(session, logContext);
+        return Promise.resolve({ kind: 'linkLost' });
+    }
 
-    return new Promise<Record<string, unknown> | null>((resolve) => {
+    return new Promise<WaitOutcome>((resolve) => {
         let resolved = false;
+        let linkTimer: ReturnType<typeof setTimeout> | null = null;
 
         const cleanup = () => {
             resolved = true;
             if (timer != null)
                 clearTimeout(timer);
+            if (linkTimer != null)
+                clearTimeout(linkTimer);
             session.listeners.delete(listener);
         };
 
@@ -414,8 +469,28 @@ function waitForEvent(
                 return;
             cleanup();
             logger.warn({ requestId: session.requestId, timeoutMs, ...logContext }, '[SESSION] waitForMessage timeout');
-            resolve(null);
+            resolve({ kind: 'ended' });
         }, timeoutMs);
+
+        /** Re-evaluate the uplink verdict and (re-)arm the wake-up for its deadline. */
+        const watchLink = () => {
+            if (resolved)
+                return;
+            const remainingMs = msUntilLinkLoss(session.linkHealth);
+            if (linkTimer != null) {
+                clearTimeout(linkTimer);
+                linkTimer = null;
+            }
+            if (remainingMs === null)
+                return;
+            if (remainingMs <= 0) {
+                cleanup();
+                reportLinkLoss(session, logContext);
+                resolve({ kind: 'linkLost' });
+                return;
+            }
+            linkTimer = setTimeout(watchLink, remainingMs);
+        };
 
         const listener = () => {
             if (resolved)
@@ -423,16 +498,19 @@ function waitForEvent(
             const event = take();
             if (event) {
                 cleanup();
-                resolve(event);
+                resolve({ kind: 'event', event });
                 return;
             }
             if (session.closed || session.cancelledReason !== undefined) {
                 cleanup();
-                resolve(null);
+                resolve({ kind: 'ended' });
+                return;
             }
+            watchLink();
         };
 
         session.listeners.add(listener);
+        watchLink();
     });
 }
 
@@ -469,4 +547,28 @@ export function closeSession(requestId: string): void {
         endSession(entry.session);
         logger.debug({ requestId }, '[SESSION] closed');
     }
+}
+
+/**
+ * Live view of the agent uplink, for /byok/debug.
+ *
+ * The three numbers that matter when a turn looks stuck are: is the uplink numbering
+ * intact (seqno gaps), did we give up on it (link losses), and is the client still holding
+ * execs open. `reclaims` is here too because a reclaim means the downlink socket died and
+ * the client reconnected — a different failure with the same symptom.
+ */
+export function agentLinkDiagnostics(): {
+    reclaims: number;
+    sessions: Array<{ requestId: string; claimed: boolean; activeExecChannels: number; queuedMessages: number } & ReturnType<typeof linkHealthSnapshot>>;
+} {
+    return {
+        reclaims: reclaimCount,
+        sessions: [...sessions.values()].map(({ session, lease }) => ({
+            requestId: session.requestId,
+            claimed: lease !== null,
+            activeExecChannels: session.execChannels.size,
+            queuedMessages: session.messages.length,
+            ...linkHealthSnapshot(session.linkHealth),
+        })),
+    };
 }

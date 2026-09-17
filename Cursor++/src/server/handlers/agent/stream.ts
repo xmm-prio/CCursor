@@ -73,7 +73,7 @@ import {
   CommunicateUpdateToolCallSchema,
 } from '../../gen/agent_v1_pb'
 import { logger, streamLogger } from '../../logger'
-import { AGENT_HEARTBEAT_INTERVAL_MS, IDLE_HINT_AFTER_MS } from './constants'
+import { IDLE_HINT_AFTER_MS } from './constants'
 import { mapPartialToolName } from './tools'
 
 type BreakdownCategoryInit = { id: string, label: string, estimatedTokens: number }
@@ -708,11 +708,32 @@ function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
+/**
+ * Upstream stream reconnects observed since the server started.
+ *
+ * Process-wide rather than per-run on purpose: this is a health signal about the provider
+ * hop, and /byok/debug is the only consumer.
+ */
+let streamRestarts = 0
+
+export function streamRestartCount(): number {
+  return streamRestarts
+}
+
+/**
+ * Translate LLM stream events into Cursor frames.
+ *
+ * Keeping the connection alive is *not* this function's job — the turn envelope
+ * (turnKeepAlive.ts) covers the whole run, including the windows before and after this
+ * stream that no per-stream heartbeat could ever reach. What stays here is the idle hint,
+ * which is a UI state transition rather than a keepalive: once the model has emitted text
+ * and then gone quiet, the client needs `thinkingCompleted(0)` to leave `streaming_text`,
+ * otherwise a provider that buffers its tool calls looks frozen mid-sentence.
+ */
 export async function* translateStream(
   events: AsyncIterable<LLMStreamEvent>,
   stepId: string = '1',
   onEvent?: (event: LLMStreamEvent) => AgentServerMessage | AgentServerMessage[] | void,
-  keepAliveMs = AGENT_HEARTBEAT_INTERVAL_MS,
   resolveToolModelCallId?: (event: LLMStreamEvent, defaultModelCallId: string) => string | undefined,
 ): AsyncIterable<AgentServerMessage> {
   const startTime = Date.now()
@@ -732,22 +753,30 @@ export async function* translateStream(
     let nextResult: IteratorResult<LLMStreamEvent>
 
     while (true) {
-      const raced = await Promise.race([
-        nextPromise.then(value => ({ kind: 'next' as const, value })),
-        delay(keepAliveMs).then(() => ({ kind: 'heartbeat' as const })),
-      ])
+      // Only arm a timer while an idle hint is actually pending; the rest of the time the
+      // turn envelope is the one watching the clock.
+      const hintPending = textChars > 0 && !idleHintSent
+      if (!hintPending) {
+        nextResult = await nextPromise
+        break
+      }
 
-      if (raced.kind === 'heartbeat') {
+      const untilHintMs = IDLE_HINT_AFTER_MS - (Date.now() - lastContentTime)
+      if (untilHintMs <= 0) {
         // 空窗期 idle hint: 有内容产出后长时间无新事件 → 注入信号让客户端转到 "Generating response"
         // 客户端状态机: streaming_text → (thinkingCompleted) → waiting_server_next → (heartbeat) → inference
-        if (!idleHintSent && textChars > 0 && Date.now() - lastContentTime >= IDLE_HINT_AFTER_MS) {
-          idleHintSent = true
-          yield thinkingCompleted(0)
-          streamLogger.debug('[LLM] idle hint: thinkingCompleted(0) injected')
-        }
-        yield heartbeat()
+        idleHintSent = true
+        yield thinkingCompleted(0)
+        streamLogger.debug('[LLM] idle hint: thinkingCompleted(0) injected')
         continue
       }
+
+      const raced = await Promise.race([
+        nextPromise.then(value => ({ kind: 'next' as const, value })),
+        delay(untilHintMs).then(() => ({ kind: 'idle' as const })),
+      ])
+      if (raced.kind === 'idle')
+        continue
 
       nextResult = raced.value
       break
@@ -846,6 +875,7 @@ export async function* translateStream(
           yield thinkingCompleted(Date.now() - thinkingStartTime)
           isThinking = false
         }
+        streamRestarts++
         streamLogger.warn({
           attempt: event.attempt,
           reason: event.reason,

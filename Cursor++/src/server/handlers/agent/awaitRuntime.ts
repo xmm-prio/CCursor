@@ -22,7 +22,7 @@ import { execMessage } from './stream';
 import { finalizeToolCall } from './toolLifecycle';
 import { buildExecToolResult, type ToolResultEnvelope } from './toolResults';
 import { annotateShellAwaitResult } from './toolkit/results/awaitToolResults';
-import { awaitExecResultAndClose, throwIfSessionCancelled, waitForPromiseWithHeartbeat } from './wait';
+import { awaitExecResultAndClose, throwIfSessionCancelled } from './wait';
 
 /** Upper bound of a single AwaitShell call, whatever the model asks for. */
 const MAX_BLOCK_UNTIL_MS = 600_000;
@@ -120,9 +120,7 @@ export async function* finalizeShellAwaitTool(
         polls++;
         const execMessageId = params.allocateExecMessageId();
         yield execMessage(execMessageId, `${params.callId}-exec-${polls}`, 'readArgs', params.readArgs);
-        const frame = yield* waitForPromiseWithHeartbeat(
-            awaitExecResultAndClose(params.session, execMessageId, READ_TIMEOUT_MS),
-        );
+        const frame = await awaitExecResultAndClose(params.session, execMessageId, READ_TIMEOUT_MS);
         const execClientMsg = frame && 'execClientMessage' in frame
             ? frame.execClientMessage as Record<string, unknown>
             : null;
@@ -145,7 +143,7 @@ export async function* finalizeShellAwaitTool(
 
         const remainingMs = deadline - Date.now();
         if (remainingMs <= 0) break;
-        yield* waitForPromiseWithHeartbeat(delay(Math.min(remainingMs, nextPollDelayMs(idlePolls))));
+        await delay(Math.min(remainingMs, nextPollDelayMs(idlePolls)));
         throwIfSessionCancelled(params.session);
     }
 

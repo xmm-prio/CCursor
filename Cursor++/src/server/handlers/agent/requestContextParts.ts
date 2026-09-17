@@ -45,7 +45,7 @@ import {
   resolveMcpServerIdentifier,
 } from './protocol/parseRunRequest'
 import { toBytes } from './protocol/shared'
-import type { AgentSession } from './session'
+import { waitForMessageMatching, type AgentSession } from './session'
 import {
   applyRuleContext,
   mergeAgentSkills,
@@ -53,7 +53,6 @@ import {
   normalizeCustomSubagent,
 } from './contextCatalog'
 import { kvGetBlob } from './stream'
-import { waitForMessageMatchingWithHeartbeat } from './wait'
 
 /** 取 blob 的等待上限 — 客户端本地内存命中,正常是毫秒级 */
 const BLOB_FETCH_TIMEOUT_MS = 10_000
@@ -127,7 +126,7 @@ async function* fetchPartBytes(
 
   const requestId = params.allocateBlobId()
   yield kvGetBlob(requestId, params.blobId)
-  const msg = yield* waitForMessageMatchingWithHeartbeat(
+  const msg = await waitForMessageMatching(
     params.session,
     (message) => {
       const kv = message.kvClientMessage as Record<string, unknown> | undefined

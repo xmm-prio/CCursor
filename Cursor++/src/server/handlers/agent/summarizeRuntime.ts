@@ -143,7 +143,6 @@ export async function* handleSummarizeAction(
         keepTail: compactionPlan.keepTail.length,
     }, '[SUMMARIZE] LLM summary starting');
 
-    let lastHeartbeatTime = Date.now();
     try {
         const llmStream = route.provider.stream({
             model: route.model,
@@ -166,17 +165,11 @@ export async function* handleSummarizeAction(
                 }, '[SUMMARIZE] LLM stream restarted, discarding partial summary');
                 summaryText = '';
                 yield heartbeat();
-                lastHeartbeatTime = Date.now();
                 continue;
             }
             if (event.type === 'text_delta') {
                 summaryText += event.text;
                 yield summary(event.text);
-            }
-            // LLM 生成期间持续 yield heartbeat, 防止客户端 stall detector 误判
-            if (Date.now() - lastHeartbeatTime >= 4000) {
-                yield heartbeat();
-                lastHeartbeatTime = Date.now();
             }
         }
     } catch (error) {

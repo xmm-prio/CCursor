@@ -51,7 +51,8 @@ describe('c3 per-exec 事件缓冲', () => {
     pushSessionMessage(session, shellChunk(1, 'mine'))
 
     const got = await pending
-    const ecm = (got as Record<string, unknown>).execClientMessage as Record<string, unknown>
+    expect(got.kind).toBe('event')
+    const ecm = (got as { event: Record<string, unknown> }).event.execClientMessage as Record<string, unknown>
     expect(ecm.id).toBe(1)
     // 另一个 exec 的事件原封不动留在它自己的缓冲里
     expect(session.execChannels.get(2)?.events).toHaveLength(1)

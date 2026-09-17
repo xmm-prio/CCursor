@@ -27,10 +27,9 @@ import {
 import { findToolByAlias } from './toolRegistry';
 import { finalizeToolCall } from './toolLifecycle';
 import { buildEditPlan, buildExecArgs, mapToolToExecArgs, resolveToolCall, type AvailableDynamicBuiltinTool, type AvailableMcpTool, type ToolCallInfo } from './tools';
-import { getBackgroundJob, registerBackgroundJob, type AgentSession } from './session';
+import { getBackgroundJob, registerBackgroundJob, waitForInteractionResponse, type AgentSession } from './session';
 import { buildExecToolResult } from './toolResults';
 import { str } from './toolkit/results/shared';
-import { waitForInteractionResponseWithHeartbeat, waitForPromiseWithHeartbeat } from './wait';
 import { performWebFetch, performWebSearch } from './web';
 import { interactionQuery } from './stream';
 import type { ToolResultEnvelope } from './toolResults';
@@ -538,7 +537,7 @@ async function* runToolCallInner(params: Parameters<typeof runToolCall>[0]): Asy
         if (params.session) {
             const interactionId = params.allocateInteractionId()
             yield interactionQuery(interactionId, 'webSearchRequestQuery', { args: startedArgs })
-            const response = yield* waitForInteractionResponseWithHeartbeat(params.session, interactionId, 'webSearchRequestResponse', null)
+            const response = await waitForInteractionResponse(params.session, interactionId, 'webSearchRequestResponse', null)
             const ir = response ? (response.interactionResponse as Record<string, unknown>) : null
             if (ir) {
                 const approval = buildWebSearchApprovalResultFromInteractionResponse(ir)
@@ -552,7 +551,7 @@ async function* runToolCallInner(params: Parameters<typeof runToolCall>[0]): Asy
         let rawToolResult: ToolResultEnvelope
         if (approved) {
             try {
-                const refs = yield* waitForPromiseWithHeartbeat(performWebSearch(String(sanitizedInput.searchTerm || sanitizedInput.search_term || '')))
+                const refs = await performWebSearch(String(sanitizedInput.searchTerm || sanitizedInput.search_term || ''))
                 rawToolResult = { result: { case: 'success', value: { references: refs } } }
             }
             catch (e) {
@@ -585,7 +584,7 @@ async function* runToolCallInner(params: Parameters<typeof runToolCall>[0]): Asy
         if (params.session) {
             const interactionId = params.allocateInteractionId()
             yield interactionQuery(interactionId, 'webFetchRequestQuery', { args: startedArgs })
-            const response = yield* waitForInteractionResponseWithHeartbeat(params.session, interactionId, 'webFetchRequestResponse', null)
+            const response = await waitForInteractionResponse(params.session, interactionId, 'webFetchRequestResponse', null)
             const ir = response ? (response.interactionResponse as Record<string, unknown>) : null
             if (ir) {
                 const approval = buildWebFetchApprovalResultFromInteractionResponse(ir)
@@ -600,7 +599,7 @@ async function* runToolCallInner(params: Parameters<typeof runToolCall>[0]): Asy
         let rawToolResult: ToolResultEnvelope
         if (approved) {
             try {
-                const fetchResult = yield* waitForPromiseWithHeartbeat(performWebFetch(String(sanitizedInput.url || '')))
+                const fetchResult = await performWebFetch(String(sanitizedInput.url || ''))
                 rawToolResult = { result: { case: 'success', value: { url: fetchResult.url, markdown: fetchResult.markdown } } }
             }
             catch (e) {

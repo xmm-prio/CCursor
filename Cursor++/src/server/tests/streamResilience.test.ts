@@ -353,7 +353,7 @@ describe('stream_restart 的 agent 侧消费', () => {
           flushPrefix()
           break
       }
-    }, 50)
+    })
 
     for await (const frame of translated)
       frames.push(frame)

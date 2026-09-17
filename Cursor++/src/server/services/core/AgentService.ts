@@ -22,6 +22,8 @@
  * 突然结束, 没有 banner。这里的修复是此功能的必要前置。
  */
 import type { ConnectRouter } from '@connectrpc/connect'
+import type { AgentServerMessage } from '../../gen/agent_v1_pb'
+import type { AgentSession } from '../../handlers/agent/session'
 import { toJson } from '@bufbuild/protobuf'
 import { ConnectError } from '@connectrpc/connect'
 import { AgentClientMessageSchema, AgentService } from '../../gen/agent_v1_pb'
@@ -32,6 +34,8 @@ import { ModelNotFoundError } from '../../handlers/models/mapper'
 import { makeByokConnectError, makeModelNotFoundError, makeProviderError } from '../../handlers/errors'
 import { ErrorDetails_Error } from '../../gen/aiserver_v1_shared_pb'
 import { claimSession, createEphemeralSession, markSessionClosed, pushSessionMessage, waitForMessage } from '../../handlers/agent/session'
+import { withTurnKeepAlive } from '../../handlers/agent/turnKeepAlive'
+import { isExecLinkLostError } from '../../handlers/agent/wait'
 import { logger } from '../../logger'
 
 /**
@@ -40,15 +44,94 @@ import { logger } from '../../logger'
  *
  * 优先级:
  *   1. 已经是 ConnectError → 直接返回 (下游工厂已构造好)
- *   2. ModelNotFoundError → 专用工厂 (is_retryable=false, title 带 modelId)
- *   3. 其他 Error → makeProviderError 兜底 (走 inferRetryable 启发式)
+ *   2. ExecLinkLostError → 上行丢包, 重试必然有效 (is_retryable=true)
+ *   3. ModelNotFoundError → 专用工厂 (is_retryable=false, title 带 modelId)
+ *   4. 其他 Error → makeProviderError 兜底 (走 inferRetryable 启发式)
  */
 function normalizeToConnectError(error: unknown, context: Record<string, string>): ConnectError {
   if (error instanceof ConnectError)
     return error
+  if (isExecLinkLostError(error)) {
+    // The turn cannot be salvaged — the tool result is simply not coming — but the failure
+    // is purely transport, so the user's one useful action is to press retry.
+    return makeByokConnectError({
+      errorCode: ErrorDetails_Error.EXTENSION_HOST_TIMEOUT,
+      title: 'Connection to the editor dropped a message',
+      detail:
+        'A message from the editor was lost on the way to the BYOK server, so this turn '
+        + 'cannot continue. This usually means the connection is unstable (remote SSH / '
+        + 'port forwarding) — please retry.',
+      isRetryable: true,
+      additionalInfo: { execMessageId: String(error.execMessageId), ...context },
+      cause: error,
+    })
+  }
   if (error instanceof ModelNotFoundError)
     return makeModelNotFoundError(error.modelId)
   return makeProviderError(error, context)
+}
+
+/**
+ * RunSSE 的全部业务动作, 抽成独立 generator 只为一件事: 让 turn keep-alive 包络
+ * 能把 **首条消息的等待** 也罩进去。
+ *
+ * 那段等待此前完全裸奔 —— waitForMessage 最长静默 30 秒, 而客户端的 stall 判定
+ * 只有几秒。把它留在 router handler 里就只能从 handleRunRequest 之后开始保活。
+ */
+async function* driveRunSSE(requestId: string, session: AgentSession): AsyncGenerator<AgentServerMessage> {
+  const firstMsg = await waitForMessage(session)
+  if (!firstMsg) {
+    // Session 建立后没等到首条消息 —— 通常是 BidiAppend 协调慢或客户端问题。
+    // 也构造一个 ErrorDetails 让客户端 banner 提示, 可 retry。
+    logger.warn({ requestId }, '[SVC] RunSSE no message received (timeout)')
+    throw makeByokConnectError({
+      errorCode: ErrorDetails_Error.EXTENSION_HOST_TIMEOUT,
+      title: 'Agent session timeout',
+      detail: 'RunSSE waited for the first BidiAppend message but none arrived. This is usually a client-side routing issue — please retry.',
+      isRetryable: true,
+      additionalInfo: { requestId },
+    })
+  }
+
+  logger.info({ requestId, keys: Object.keys(firstMsg) }, '[SVC] RunSSE first message')
+
+  // 队列消息场景: 客户端先发 conversationAction(含用户文本), 再发 runRequest。
+  // 如果首条不是 runRequest, 提取 conversationAction 中的 userText, 继续等 runRequest。
+  let queuedUserText: string | undefined
+  let actualFirstMsg = firstMsg
+
+  if (!('runRequest' in firstMsg) && 'conversationAction' in firstMsg) {
+    const ca = firstMsg.conversationAction as Record<string, unknown> | undefined
+    const ua = ca?.userMessageAction as Record<string, unknown> | undefined
+    const um = ua?.userMessage as Record<string, unknown> | undefined
+    queuedUserText = typeof um?.text === 'string' && um.text ? um.text : undefined
+    logger.info({ requestId, queuedUserText: queuedUserText?.slice(0, 80) }, '[SVC] RunSSE got conversationAction before runRequest — waiting for runRequest')
+    const nextMsg = await waitForMessage(session)
+    if (!nextMsg || !('runRequest' in nextMsg)) {
+      logger.warn({ requestId, nextMsgKeys: nextMsg ? Object.keys(nextMsg) : null }, '[SVC] RunSSE never received runRequest after conversationAction')
+      return
+    }
+    actualFirstMsg = nextMsg
+  }
+
+  if (!('runRequest' in actualFirstMsg))
+    return
+
+  // 如果 runRequest 是 resumeAction 且有来自 conversationAction 的用户文本, 注入
+  if (queuedUserText) {
+    const rr = actualFirstMsg.runRequest as Record<string, unknown>
+    const action = rr?.action as Record<string, unknown> | undefined
+    if (action && !action.userMessageAction && action.resumeAction) {
+      action.userMessageAction = {
+        userMessage: { text: queuedUserText },
+        requestContext: (action.resumeAction as Record<string, unknown>)?.requestContext,
+      }
+      delete action.resumeAction
+      logger.info({ requestId, textLen: queuedUserText.length }, '[SVC] injected queued userText into resumeAction → userMessageAction')
+    }
+  }
+
+  yield* handleRunRequest(actualFirstMsg, session)
 }
 
 function isStreamDestroyedError(error: unknown): boolean {
@@ -120,7 +203,7 @@ export default (router: ConnectRouter) => {
       })()
 
       try {
-        for await (const frame of handleRunRequest(firstMsg, session)) {
+        for await (const frame of withTurnKeepAlive(handleRunRequest(firstMsg, session))) {
           yield frame
         }
       }
@@ -166,58 +249,8 @@ export default (router: ConnectRouter) => {
       const session = lease.session
 
       try {
-        const firstMsg = await waitForMessage(session)
-        if (!firstMsg) {
-          // Session 建立后没等到首条消息 —— 通常是 BidiAppend 协调慢或客户端问题。
-          // 也构造一个 ErrorDetails 让客户端 banner 提示, 可 retry。
-          logger.warn({ requestId }, '[SVC] RunSSE no message received (timeout)')
-          throw makeByokConnectError({
-            errorCode: ErrorDetails_Error.EXTENSION_HOST_TIMEOUT,
-            title: 'Agent session timeout',
-            detail: 'RunSSE waited for the first BidiAppend message but none arrived. This is usually a client-side routing issue — please retry.',
-            isRetryable: true,
-            additionalInfo: { requestId },
-          })
-        }
-
-        logger.info({ requestId, keys: Object.keys(firstMsg) }, '[SVC] RunSSE first message')
-
-        // 队列消息场景: 客户端先发 conversationAction(含用户文本), 再发 runRequest。
-        // 如果首条不是 runRequest, 提取 conversationAction 中的 userText, 继续等 runRequest。
-        let queuedUserText: string | undefined
-        let actualFirstMsg = firstMsg
-
-        if (!('runRequest' in firstMsg) && 'conversationAction' in firstMsg) {
-          const ca = firstMsg.conversationAction as Record<string, unknown> | undefined
-          const ua = ca?.userMessageAction as Record<string, unknown> | undefined
-          const um = ua?.userMessage as Record<string, unknown> | undefined
-          queuedUserText = typeof um?.text === 'string' && um.text ? um.text : undefined
-          logger.info({ requestId, queuedUserText: queuedUserText?.slice(0, 80) }, '[SVC] RunSSE got conversationAction before runRequest — waiting for runRequest')
-          const nextMsg = await waitForMessage(session)
-          if (!nextMsg || !('runRequest' in nextMsg)) {
-            logger.warn({ requestId, nextMsgKeys: nextMsg ? Object.keys(nextMsg) : null }, '[SVC] RunSSE never received runRequest after conversationAction')
-            return
-          }
-          actualFirstMsg = nextMsg
-        }
-
-        if ('runRequest' in actualFirstMsg) {
-          // 如果 runRequest 是 resumeAction 且有来自 conversationAction 的用户文本, 注入
-          if (queuedUserText) {
-            const rr = actualFirstMsg.runRequest as Record<string, unknown>
-            const action = rr?.action as Record<string, unknown> | undefined
-            if (action && !action.userMessageAction && action.resumeAction) {
-              action.userMessageAction = {
-                userMessage: { text: queuedUserText },
-                requestContext: (action.resumeAction as Record<string, unknown>)?.requestContext,
-              }
-              delete action.resumeAction
-              logger.info({ requestId, textLen: queuedUserText.length }, '[SVC] injected queued userText into resumeAction → userMessageAction')
-            }
-          }
-          for await (const frame of handleRunRequest(actualFirstMsg, session)) {
-            yield frame
-          }
+        for await (const frame of withTurnKeepAlive(driveRunSSE(requestId, session))) {
+          yield frame
         }
       }
       catch (error) {
