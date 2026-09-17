@@ -22,6 +22,25 @@ import { DEFAULT_HOST, DEFAULT_PORT, PORT_FALLBACK_SPAN, SSE_EVENT_ROUTES } from
 export const READY_GATE_TIMEOUT_MS = 10000;
 
 /**
+ * Version stamp of the renderer channel payload.
+ *
+ * V2 replaced the SSE-only subscription with a WebSocket-first one. That is not
+ * a cosmetic change: a renderer gets six HTTP/1.1 sockets per origin *for the
+ * whole application*, and an SSE subscription holds one of them for as long as
+ * the window lives. With several workspaces open, the permanent streams eat the
+ * budget and every other request to the BYOK port queues behind connections
+ * that never end. WebSocket connections come from a separate, far larger pool.
+ *
+ * The stamp exists so an installation carrying the V1 payload is recognised as
+ * stale and upgraded in place, instead of being reported as already patched —
+ * the same discipline HTTP11_ROUTER_VERSION_MARKER applies to the node routers.
+ */
+export const RENDERER_CHANNEL_VERSION_MARKER = '__byokRendererChannelV2';
+
+/** WebSocket path of the event channel, served next to /byok/events. */
+export const CHANNEL_WS_PATH = '/byok/ws';
+
+/**
  * Ordered list of base URLs a consumer should try when looking for the server.
  *
  * `externalUrl` (Remote SSH / WSL forwarded address) wins when routes.json
@@ -66,6 +85,23 @@ export function splitRedirect(redirect) {
  * ceiling (READY_GATE_TIMEOUT_MS); on expiry the request is released rather
  * than left hanging, since a stuck UI is worse than one flicker.
  *
+ * ## Why the subscription prefers WebSocket
+ *
+ * The channel is one connection held open for the lifetime of the window, and
+ * a renderer only gets six HTTP/1.1 sockets per origin — a budget Chromium
+ * shares across every Cursor window, not one per window. An SSE subscription
+ * therefore spends one of six globally, permanently, per workspace, and once
+ * they are gone every ordinary request to the BYOK port waits for a stream
+ * that by design never ends. WebSocket connections are pooled separately and
+ * far more generously, so the long-lived channel stops competing with the
+ * short-lived traffic.
+ *
+ * SSE remains the fallback rather than a legacy path: a Content-Security-Policy
+ * that forbids `ws:` would otherwise take the channel down entirely, and a
+ * single flicker of the model list is much cheaper than no channel at all. The
+ * fallback is sticky for the session — a CSP does not change at runtime, so
+ * re-probing WebSocket on every reconnect would only add latency.
+ *
  * Expected globals in the host payload: `_origFetch`, `__byokGlassStatus`,
  * `__byokRefreshModels`. Exposed to the host payload: `_byokUrl`, `_restPaths`,
  * `_restSet`, `_byokGated(svc, method)`, `_byokGatedPath(url)`,
@@ -73,9 +109,11 @@ export function splitRedirect(redirect) {
  */
 export function buildRendererChannelSource({ candidates, byokRedirect }) {
   const { rest, services, methods } = splitRedirect(byokRedirect);
-  return `var _byokCandidates=${JSON.stringify(candidates)};var _byokUrl=_byokCandidates[0];`
+  const routesEvent = JSON.stringify(SSE_EVENT_ROUTES);
+  return `/* ${RENDERER_CHANNEL_VERSION_MARKER} */`
+    + `var _byokCandidates=${JSON.stringify(candidates)};var _byokUrl=_byokCandidates[0];`
     + `var _gateRest=${JSON.stringify(rest)},_gateSvc=new Set(${JSON.stringify(services)}),_gateMtd=new Set(${JSON.stringify(methods)});`
-    + `var _byokReadyGate=false,_byokWaiters=[],_byokEs=null,_byokEsUrl="",_byokRetry=1000,_byokProbing=false,_byokTimer=null;`
+    + `var _byokReadyGate=false,_byokWaiters=[],_byokLink=null,_byokLinkUrl="",_byokRetry=1000,_byokProbing=false,_byokTimer=null,_byokNoWs=false;`
     + `function _byokRelease(reason){if(_byokReadyGate)return;_byokReadyGate=true;globalThis.__byokRoutesReady=true;`
     + `var waiters=_byokWaiters;_byokWaiters=[];for(var i=0;i<waiters.length;i++){try{waiters[i]()}catch(e){}}`
     + `console.log("[BYOK] readiness gate released ("+reason+")")}`
@@ -93,22 +131,55 @@ export function buildRendererChannelSource({ candidates, byokRedirect }) {
     // Endpoint moves (port fallback, Remote SSH forwarding) are only adopted
     // once the new address answers /health — otherwise an unreachable
     // externalUrl would bounce us off a working connection on every payload.
-    + `_byokUrl=_byokEsUrl||target;`
-    + `if(target&&target!==_byokEsUrl){_byokProbe(target).then(function(ok){if(!ok||target===_byokEsUrl)return;`
+    + `_byokUrl=_byokLinkUrl||target;`
+    + `if(target&&target!==_byokLinkUrl){_byokProbe(target).then(function(ok){if(!ok||target===_byokLinkUrl)return;`
     + `console.log("[BYOK] endpoint moved to "+target);_byokUrl=target;_byokConnect(target)})}}`
     + `function _byokProbe(base){return new Promise(function(resolve){var done=false;var timer=setTimeout(function(){if(!done){done=true;resolve(false)}},1500);`
     + `_origFetch(base+"/health",{cache:"no-store"}).then(function(r){return r.ok?r.json():null}).then(function(d){if(done)return;done=true;clearTimeout(timer);resolve(!!(d&&d.ok===true&&d.mode==="byok"))})`
     + `.catch(function(){if(done)return;done=true;clearTimeout(timer);resolve(false)})})}`
-    + `function _byokConnect(base){try{if(_byokEs){_byokEs.close();_byokEs=null}}catch(e){}`
-    + `try{var es=new EventSource(base+"/byok/events");_byokEs=es;_byokEsUrl=base;_byokUrl=base;`
+    // One link at a time, whatever its transport. Everything that can end a
+    // link funnels through _byokLinkLost so the retry discipline has a single
+    // home and a superseded link can never schedule a reconnect of its own.
+    + `function _byokDropLink(){if(!_byokLink)return;var link=_byokLink;_byokLink=null;_byokLinkUrl="";try{link.close()}catch(e){}}`
+    + `function _byokLinkLost(link,reason){if(_byokLink!==link)return;_byokLink=null;_byokLinkUrl="";try{link.close()}catch(e){}`
+    + `globalThis.__byokGlassStatus&&globalThis.__byokGlassStatus(false,void 0);`
+    // A shutdown means the owner window is handing the server over: the next
+    // owner may come up on another port, so retry from the full candidate list
+    // immediately rather than continuing an exponential backoff.
+    + `if(reason==="shutdown"){_byokRetry=1000;console.log("[BYOK] server shutting down, re-discovering endpoint")}`
+    + `_byokSchedule()}`
+    + `function _byokRefresh(){console.log("[BYOK] refresh event received");globalThis.__byokRefreshModels&&globalThis.__byokRefreshModels()}`
+    + `function _byokWsUrl(base){return String(base).replace(/^http/,"ws")+${JSON.stringify(CHANNEL_WS_PATH)}}`
+    + `function _byokConnectWs(base){var ws;`
+    + `try{ws=new WebSocket(_byokWsUrl(base))}`
+    + `catch(e){_byokNoWs=true;console.log("[BYOK] WebSocket channel unavailable ("+(e&&e.message||e)+"), using SSE");_byokConnectSse(base);return}`
+    + `var opened=false;var link={close:function(){try{ws.close()}catch(e){}}};`
+    + `_byokLink=link;_byokLinkUrl=base;_byokUrl=base;`
+    + `ws.addEventListener("open",function(){opened=true;_byokRetry=1000;globalThis.__byokGlassStatus&&globalThis.__byokGlassStatus(true,void 0)});`
+    + `ws.addEventListener("message",function(ev){var m;try{m=JSON.parse(ev.data)}catch(e){console.warn("[BYOK] ws payload parse failed:",e&&e.message||e);return}`
+    + `if(!m||!m.event)return;`
+    + `if(m.event==="shutdown"){_byokLinkLost(link,"shutdown");return}`
+    + `if(m.event==="refresh"){_byokRefresh();return}`
+    + `if(m.event===${routesEvent}){_byokApplyRoutes(m.data)}});`
+    // A refused upgrade (CSP, a proxy that drops it, a server predating the
+    // endpoint) closes without ever opening — that is the signal to fall back.
+    + `ws.addEventListener("close",function(){if(_byokLink!==link)return;`
+    + `if(!opened){_byokNoWs=true;_byokLink=null;_byokLinkUrl="";console.log("[BYOK] WebSocket channel refused, falling back to SSE");_byokConnectSse(base);return}`
+    + `_byokLinkLost(link,"closed")});}`
+    + `function _byokConnectSse(base){`
+    + `try{var es=new EventSource(base+"/byok/events");var link={close:function(){try{es.close()}catch(e){}}};`
+    + `_byokLink=link;_byokLinkUrl=base;_byokUrl=base;`
     + `es.addEventListener("open",function(){_byokRetry=1000;globalThis.__byokGlassStatus&&globalThis.__byokGlassStatus(true,void 0)});`
-    + `es.addEventListener("refresh",function(){console.log("[BYOK] refresh event received");globalThis.__byokRefreshModels&&globalThis.__byokRefreshModels()});`
-    + `es.addEventListener(${JSON.stringify(SSE_EVENT_ROUTES)},function(ev){try{_byokApplyRoutes(JSON.parse(ev.data))}catch(e){console.warn("[BYOK] routes payload parse failed:",e&&e.message||e)}});`
-    + `es.addEventListener("error",function(){globalThis.__byokGlassStatus&&globalThis.__byokGlassStatus(false,void 0);if(_byokEs!==es)return;try{es.close()}catch(e){}_byokEs=null;_byokEsUrl="";_byokSchedule()})}`
+    + `es.addEventListener("refresh",function(){_byokRefresh()});`
+    + `es.addEventListener("shutdown",function(){_byokLinkLost(link,"shutdown")});`
+    + `es.addEventListener(${routesEvent},function(ev){try{_byokApplyRoutes(JSON.parse(ev.data))}catch(e){console.warn("[BYOK] routes payload parse failed:",e&&e.message||e)}});`
+    + `es.addEventListener("error",function(){_byokLinkLost(link,"error")})}`
     + `catch(e){console.warn("[BYOK] EventSource init failed:",e&&e.message||e);_byokSchedule()}}`
-    + `function _byokSchedule(){if(_byokEs||_byokProbing||_byokTimer)return;var delay=_byokRetry;_byokRetry=Math.min(_byokRetry*2,10000);`
+    + `function _byokConnect(base){_byokDropLink();`
+    + `if(_byokNoWs||typeof WebSocket==="undefined"){_byokConnectSse(base)}else{_byokConnectWs(base)}}`
+    + `function _byokSchedule(){if(_byokLink||_byokProbing||_byokTimer)return;var delay=_byokRetry;_byokRetry=Math.min(_byokRetry*2,10000);`
     + `_byokTimer=setTimeout(function(){_byokTimer=null;_byokDiscover()},delay)}`
-    + `function _byokDiscover(){if(_byokProbing||_byokEs)return;_byokProbing=true;var i=0;`
+    + `function _byokDiscover(){if(_byokProbing||_byokLink)return;_byokProbing=true;var i=0;`
     + `(function next(){if(i>=_byokCandidates.length){_byokProbing=false;_byokSchedule();return}`
     + `var base=_byokCandidates[i++];_byokProbe(base).then(function(ok){if(ok){_byokProbing=false;_byokConnect(base)}else{next()}})})()}`
     + `_byokDiscover();`;

@@ -81,6 +81,8 @@ CLI 打包后**没有任何运行时依赖**，所以这里不需要执行 `npm 
 有多份 Cursor 安装？CLI 会选版本最高的那份，并打印被跳过的路径；可用 `CCURSOR_CURSOR_ROOT=<resources/app 路径>` 覆盖。
 
 > 从旧版本升级？请先 `uninstall` 再 `install`。注入的路由器带有版本标记，在旧补丁上叠加安装不会生效。
+>
+> `status` 会明确区分这种情况：由旧版 installer 打过补丁的 bundle 会被报成 **"payload is stale — re-run install"**，而不是当作健康安装，避免新版修复悄无声息地没到你手上。
 
 ---
 
@@ -113,6 +115,9 @@ CLI 打包后**没有任何运行时依赖**，所以这里不需要执行 `npm 
 - **Remote SSH** — A headless companion extension serves the remote host  
   **Remote SSH** — 无 UI 的伴生扩展为远端提供服务，本地侧保留界面
 
+- **Multi-Window Concurrency** — One machine-wide server tuned for many workspaces streaming at once  
+  **多窗口并发** — 整机单一服务器，按多工作区同时出流的负载调参（见下文[多窗口并发](#多窗口并发)）
+
 ---
 
 ## How It Works / 工作原理
@@ -122,6 +127,7 @@ Cursor IDE
   │
   ├─ inject-patch (renderer)
   │   └─ intercept ConnectRPC + REST → route to BYOK server
+  │       + push channel: WebSocket /byok/ws (fallback: SSE /byok/events)
   │
   ├─ always-local-patch (extension host)
   │   └─ rewrite http/https.request + hot-reload from routes.json
@@ -135,6 +141,43 @@ Cursor IDE
 
 All patches create backup files and are fully reversible via `uninstall`.  
 所有补丁创建备份文件，可通过 `uninstall` 完全还原。
+
+---
+
+## 多窗口并发
+
+BYOK 服务器**整机只有一个**：第一个抢到 `:39831` 的 Cursor 窗口成为 owner，其余窗口作为 peer 把流量路由过去。因此同时打开几个工作区时，所有 agent（以及它们派生的 subagent）都汇聚到同一个进程、同一组连接池上。下面这几条约束就是为这种形态设置的。
+
+### 上游连接池
+
+一次 agent turn 会独占目标服务商 origin 的一条 socket，直到这轮结束 —— 通常是几分钟。池子满了之后 undici 会把后续请求排进一个**没有超时、不发事件、不打日志**的内部队列，表现就是"agent 一直不出第一个 token"。
+
+所以 `UPSTREAM_MAX_CONNECTIONS_PER_ORIGIN` 取 64（见 `src/server/config/upstreamTuning.ts`），让真正的约束回到服务商自己的限流上 —— 429 会被 `retryPolicy.ts` 判定为可重试并退避，而本地队列不会。socket 是懒创建的，空闲时这个上限不占任何资源。
+
+服务器还会在**跨过池子上限的那一刻**打一条 warn，而不是每条请求都打，因为值得知道的是"从这里开始会排队"这个时刻。
+
+### 推送通道：WebSocket 优先
+
+renderer 到同一 origin 的 HTTP/1.1 连接上限是 6 条，而且这个额度是 **Chromium 在所有 Cursor 窗口之间共享的**，不是每个窗口一份。SSE 订阅是一条永不结束的请求，于是每多开一个工作区就永久吃掉六分之一；额度耗尽后，所有发往 BYOK 端口的普通请求都会堵在这些永不结束的流后面。
+
+现在 renderer 优先走 WebSocket（`/byok/ws`），它走的是另一个大得多的连接池。`/byok/events` 的 SSE 保留为回退路径 —— 如果 Content-Security-Policy 禁止 `ws:`，通道会自动降级而不是直接失联，且降级在本次会话内保持（CSP 不会在运行期改变，每次重连都重试只会徒增延迟）。
+
+### 背压与内存
+
+- 日志推送有 1 MiB 的缓冲预算。某个窗口停止读取时（挂起的笔记本、拥塞的 SSH 隧道），它的日志会被丢弃而不是无限堆在共享进程里；恢复后该窗口会收到一条"丢了多少行"的提示。routes / refresh 这类事件帧不受此限制，因为消费方无法自行重建这些状态。
+- blob 内存缓存自带上界（20000 条 / 128 MiB，LRU）。淘汰是安全的：每条 blob 同时写入了 sqlite，未命中时 `warmupBlobsAsync` 会读回来。
+- 关闭服务器时会先广播 shutdown、再挂断所有订阅、最后强制关闭连接。推送订阅和 agent turn 都是"设计上不会结束"的请求，不这样做端口会一直被占着，其他窗口的接管尝试全部失败。
+
+### 排查
+
+`curl http://127.0.0.1:39831/byok/debug` 给出四组数据：
+
+| 字段 | 回答什么问题 |
+|---|---|
+| `upstream` | 每个 origin 现在有几条流在跑、峰值多少、跨过池子上限几次 |
+| `pushChannel` | 每个通道有几个订阅者、各走什么传输、丢了多少日志 |
+| `blobCache` | 缓存占了多少内存、淘汰过多少条 |
+| `agentLink` | 编辑器上行链路是否丢包、流重启了几次 |
 
 ---
 

@@ -14,7 +14,7 @@
 import { existsSync, readFileSync } from 'fs';
 import { restoreBackup } from './backup.js';
 import { installExtension, isExtensionInstalled, removeExtension } from './extension-embed.js';
-import { checkGlassExtensionAllowlist, isInjectPatched, patchInject } from './patch-inject.js';
+import { checkGlassExtensionAllowlist, inspectInjectPatch, patchInject } from './patch-inject.js';
 import { checkAlwaysLocalPatch, inspectAlwaysLocalPatch, patchAlwaysLocal } from './patch-always-local.js';
 import { checkSigBypass, inspectSigBypass, patchSigBypass, SIG_BYPASS_TAG } from './patch-sig-bypass.js';
 import { checkAgentHostPatch, getAgentHostBackupTargets, inspectAgentHostPatch, patchAgentHost } from './patch-agent-host.js';
@@ -79,8 +79,16 @@ export const PATCH_STEPS = [
           lines.push(line(NA, `Renderer hook (${label}): bundle not present`));
           continue;
         }
-        const injected = isInjectPatched(readFileSync(file, 'utf-8'));
-        lines.push(line(injected ? OK : FAIL, `Renderer hook ${injected ? 'injected' : 'not injected'} (${label})`));
+        const hook = inspectInjectPatch(readFileSync(file, 'utf-8'));
+        // A stale payload is reported as a failure on purpose: the bundle is
+        // patched and Cursor works, but the window is still on the previous
+        // routes channel, which is exactly the state a silent "OK" would hide.
+        const note = hook.upToDate
+          ? 'injected'
+          : hook.payload && hook.callSite
+            ? 'injected but payload is stale — re-run install'
+            : 'not injected';
+        lines.push(line(hook.upToDate ? OK : FAIL, `Renderer hook ${note} (${label})`));
       }
       return { ok: allOk(lines), lines };
     },
@@ -217,13 +225,20 @@ function checkRendererHook(paths, log) {
     log?.(`  [${allowlist.ok ? 'OK' : 'FAIL'}] Extension allowlist (${label}): ${allowlist.detail}`);
     if (!allowlist.ok) ok = false;
 
-    if (isInjectPatched(source)) {
+    const hook = inspectInjectPatch(source);
+    if (hook.upToDate) {
       log?.(`  [OK] Renderer hook (${label}): payload + active transport call site`);
       continue;
     }
-    if (source.includes('__byokWrapTransport') || source.includes('CURSOR-BYOK-HOOK-START')) {
+    if (!hook.consistent) {
       log?.(`  [FAIL] Renderer hook (${label}) is partial (payload/call-site mismatch)`);
       ok = false;
+      continue;
+    }
+    // Patched by an older installer: install upgrades the payload in place, so
+    // this is a state install can reach, which is what `check` reports on.
+    if (hook.payload) {
+      log?.(`  [OK] Renderer hook (${label}): payload is stale, install will upgrade it`);
       continue;
     }
     // Kept in sync with patch-inject.js ANCHORS — 3.17.8 shortened the module

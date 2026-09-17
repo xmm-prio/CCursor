@@ -9,16 +9,46 @@ import { createBackup } from './backup.js';
 import { updateChecksums } from './checksum.js';
 import { loadRoutes } from './routes.js';
 import { BASE_REDIRECT, BYOK_REDIRECT } from './defaults.js';
-import { buildEndpointCandidates, buildRendererChannelSource } from './routes-channel.js';
+import { buildEndpointCandidates, buildRendererChannelSource, RENDERER_CHANNEL_VERSION_MARKER } from './routes-channel.js';
 
 const HOOK_MARKER = '__byokWrapTransport';
 const HOOK_SOURCE_MARKER = 'CURSOR-BYOK-HOOK-START';
 const HOOK_CALL_SITE = `typeof globalThis.${HOOK_MARKER}==="function"?globalThis.${HOOK_MARKER}(`;
+const HOOK_HEAD_WINDOW = 120000;
 
-/** Verify both the prepended payload and the active Connect transport call site. */
+/**
+ * Classify what is already in a workbench bundle.
+ *
+ * Three facts, because they fail independently: the prepended payload, the
+ * rewritten Connect transport call site, and the version of the routes channel
+ * inside the payload. The last one is why this is not a boolean — a bundle can
+ * be correctly patched by an older installer and still need the current
+ * payload, and reporting that as "already patched" is how a fix silently fails
+ * to reach the user.
+ */
+function inspectHook(code) {
+  const head = code.slice(0, HOOK_HEAD_WINDOW);
+  const payload = head.includes(`/* ${HOOK_SOURCE_MARKER} */`);
+  const callSite = code.includes(HOOK_CALL_SITE);
+  const currentChannel = head.includes(RENDERER_CHANNEL_VERSION_MARKER);
+  return {
+    payload,
+    callSite,
+    currentChannel,
+    /** Payload and call site agree — anything else is a half-applied patch. */
+    consistent: payload === callSite,
+    upToDate: payload && callSite && currentChannel,
+  };
+}
+
+/** Verify the payload, the active Connect transport call site and the channel version. */
 export function isInjectPatched(code) {
-  return code.slice(0, 120000).includes(`/* ${HOOK_SOURCE_MARKER} */`)
-    && code.includes(HOOK_CALL_SITE);
+  return inspectHook(code).upToDate;
+}
+
+/** Full classification, for status output and the dry-run check. */
+export function inspectInjectPatch(code) {
+  return inspectHook(code);
 }
 // ConnectRPC 客户端模块的 esbuild 注册键。
 //
@@ -725,13 +755,18 @@ export function checkGlassExtensionAllowlist(code) {
 
 function patchSingleWorkbench(filePath, label, paths, log) {
   const code = readFileSync(filePath, 'utf-8');
+  const state = inspectHook(code);
 
-  if (isInjectPatched(code)) {
+  if (state.upToDate) {
     log?.(`[inject] ${label}: already patched`);
     return;
   }
-  if (code.includes(HOOK_MARKER) || code.includes(HOOK_SOURCE_MARKER)) {
+  if (!state.consistent) {
     throw new Error(`${label}: partial renderer hook detected (payload/call-site mismatch)`);
+  }
+  if (state.payload) {
+    upgradeHookPayload(filePath, label, code, paths, log);
+    return;
   }
 
   const target = findTarget(code, log);
@@ -755,6 +790,33 @@ function patchSingleWorkbench(filePath, label, paths, log) {
   patched = patchGlassExtensionAllowlist(patched, log);
 
   if (!patched.includes(HOOK_MARKER)) throw new Error(`Verification failed for ${label}`);
+
+  createBackup(filePath, 'inject', log);
+  writeFileSync(filePath, patched);
+  updateChecksums(paths, [filePath], 'inject', log);
+}
+
+/**
+ * Refresh a bundle that carries an older payload, without re-running the AST
+ * rewrites that are already in it.
+ *
+ * Prepending is enough to take over: the payload is one IIFE guarded by
+ * `globalThis.__byokReady`, so the copy that runs first wins and the stale one
+ * returns immediately. The call-site rewrite and the aiService capture are
+ * already present and are not version dependent, and the remaining rewrites
+ * (MAX Mode, KaTeX, Glass allowlist) were applied by the earlier install —
+ * re-applying them to an already-patched bundle is what this path exists to
+ * avoid.
+ *
+ * createBackup keeps the earliest backup of the `inject` tag, so uninstall
+ * still restores the pristine bundle rather than the previously patched one.
+ */
+function upgradeHookPayload(filePath, label, code, paths, log) {
+  log?.(`[inject] ${label}: payload is stale, upgrading routes channel to ${RENDERER_CHANNEL_VERSION_MARKER}`);
+  const payload = buildHookPayload(paths.hasGlass);
+  const patched = `/* ${HOOK_SOURCE_MARKER} */${payload}/* CURSOR-BYOK-HOOK-END */;${code}`;
+
+  if (!isInjectPatched(patched)) throw new Error(`Payload upgrade verification failed for ${label}`);
 
   createBackup(filePath, 'inject', log);
   writeFileSync(filePath, patched);

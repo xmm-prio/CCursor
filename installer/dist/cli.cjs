@@ -6897,6 +6897,8 @@ function updateChecksums(paths, modifiedFiles, tag, log) {
 
 // src/routes-channel.js
 var READY_GATE_TIMEOUT_MS = 1e4;
+var RENDERER_CHANNEL_VERSION_MARKER = "__byokRendererChannelV2";
+var CHANNEL_WS_PATH = "/byok/ws";
 function buildEndpointCandidates({ host, port, externalUrl }) {
   const base2 = String(host || DEFAULT_HOST);
   const bracketed = base2.includes(":") && !base2.startsWith("[") ? `[${base2}]` : base2;
@@ -6922,7 +6924,8 @@ function splitRedirect(redirect) {
 }
 function buildRendererChannelSource({ candidates, byokRedirect }) {
   const { rest, services, methods } = splitRedirect(byokRedirect);
-  return `var _byokCandidates=${JSON.stringify(candidates)};var _byokUrl=_byokCandidates[0];var _gateRest=${JSON.stringify(rest)},_gateSvc=new Set(${JSON.stringify(services)}),_gateMtd=new Set(${JSON.stringify(methods)});var _byokReadyGate=false,_byokWaiters=[],_byokEs=null,_byokEsUrl="",_byokRetry=1000,_byokProbing=false,_byokTimer=null;function _byokRelease(reason){if(_byokReadyGate)return;_byokReadyGate=true;globalThis.__byokRoutesReady=true;var waiters=_byokWaiters;_byokWaiters=[];for(var i=0;i<waiters.length;i++){try{waiters[i]()}catch(e){}}console.log("[BYOK] readiness gate released ("+reason+")")}setTimeout(function(){_byokRelease("timeout after ${READY_GATE_TIMEOUT_MS}ms, requests fall through to the official API")},${READY_GATE_TIMEOUT_MS});function __byokAwaitReady(){if(_byokReadyGate)return Promise.resolve();return new Promise(function(res){_byokWaiters.push(res)})}globalThis.__byokAwaitReady=__byokAwaitReady;function _byokGated(svc,mtd){if(_byokReadyGate)return false;return _gateSvc.has(svc)||_gateMtd.has(svc+"/"+mtd)}function _byokGatedPath(u){if(_byokReadyGate)return false;for(var i=0;i<_gateRest.length;i++){if(String(u).indexOf(_gateRest[i])!==-1)return true}return false}function _byokApplyRoutes(p){if(!p||typeof p!=="object")return;_restPaths=Array.isArray(p.rest)?p.rest:[];_restSet=new Set(_restPaths);var srv=p.server||{},target=srv.externalUrl||srv.url||_byokUrl;console.log("[BYOK] routes applied: endpoint="+target+", REST="+_restPaths.length+", ConnectRPC="+((p.services||[]).length+(p.methods||[]).length)+", BYOK="+(p.byokMode?"ON":"OFF"));globalThis.__byokGlassStatus&&globalThis.__byokGlassStatus(true,!!p.byokMode);_byokRelease("routes received");_byokUrl=_byokEsUrl||target;if(target&&target!==_byokEsUrl){_byokProbe(target).then(function(ok){if(!ok||target===_byokEsUrl)return;console.log("[BYOK] endpoint moved to "+target);_byokUrl=target;_byokConnect(target)})}}function _byokProbe(base){return new Promise(function(resolve){var done=false;var timer=setTimeout(function(){if(!done){done=true;resolve(false)}},1500);_origFetch(base+"/health",{cache:"no-store"}).then(function(r){return r.ok?r.json():null}).then(function(d){if(done)return;done=true;clearTimeout(timer);resolve(!!(d&&d.ok===true&&d.mode==="byok"))}).catch(function(){if(done)return;done=true;clearTimeout(timer);resolve(false)})})}function _byokConnect(base){try{if(_byokEs){_byokEs.close();_byokEs=null}}catch(e){}try{var es=new EventSource(base+"/byok/events");_byokEs=es;_byokEsUrl=base;_byokUrl=base;es.addEventListener("open",function(){_byokRetry=1000;globalThis.__byokGlassStatus&&globalThis.__byokGlassStatus(true,void 0)});es.addEventListener("refresh",function(){console.log("[BYOK] refresh event received");globalThis.__byokRefreshModels&&globalThis.__byokRefreshModels()});es.addEventListener(${JSON.stringify(SSE_EVENT_ROUTES)},function(ev){try{_byokApplyRoutes(JSON.parse(ev.data))}catch(e){console.warn("[BYOK] routes payload parse failed:",e&&e.message||e)}});es.addEventListener("error",function(){globalThis.__byokGlassStatus&&globalThis.__byokGlassStatus(false,void 0);if(_byokEs!==es)return;try{es.close()}catch(e){}_byokEs=null;_byokEsUrl="";_byokSchedule()})}catch(e){console.warn("[BYOK] EventSource init failed:",e&&e.message||e);_byokSchedule()}}function _byokSchedule(){if(_byokEs||_byokProbing||_byokTimer)return;var delay=_byokRetry;_byokRetry=Math.min(_byokRetry*2,10000);_byokTimer=setTimeout(function(){_byokTimer=null;_byokDiscover()},delay)}function _byokDiscover(){if(_byokProbing||_byokEs)return;_byokProbing=true;var i=0;(function next(){if(i>=_byokCandidates.length){_byokProbing=false;_byokSchedule();return}var base=_byokCandidates[i++];_byokProbe(base).then(function(ok){if(ok){_byokProbing=false;_byokConnect(base)}else{next()}})})()}_byokDiscover();`;
+  const routesEvent = JSON.stringify(SSE_EVENT_ROUTES);
+  return `/* ${RENDERER_CHANNEL_VERSION_MARKER} */var _byokCandidates=${JSON.stringify(candidates)};var _byokUrl=_byokCandidates[0];var _gateRest=${JSON.stringify(rest)},_gateSvc=new Set(${JSON.stringify(services)}),_gateMtd=new Set(${JSON.stringify(methods)});var _byokReadyGate=false,_byokWaiters=[],_byokLink=null,_byokLinkUrl="",_byokRetry=1000,_byokProbing=false,_byokTimer=null,_byokNoWs=false;function _byokRelease(reason){if(_byokReadyGate)return;_byokReadyGate=true;globalThis.__byokRoutesReady=true;var waiters=_byokWaiters;_byokWaiters=[];for(var i=0;i<waiters.length;i++){try{waiters[i]()}catch(e){}}console.log("[BYOK] readiness gate released ("+reason+")")}setTimeout(function(){_byokRelease("timeout after ${READY_GATE_TIMEOUT_MS}ms, requests fall through to the official API")},${READY_GATE_TIMEOUT_MS});function __byokAwaitReady(){if(_byokReadyGate)return Promise.resolve();return new Promise(function(res){_byokWaiters.push(res)})}globalThis.__byokAwaitReady=__byokAwaitReady;function _byokGated(svc,mtd){if(_byokReadyGate)return false;return _gateSvc.has(svc)||_gateMtd.has(svc+"/"+mtd)}function _byokGatedPath(u){if(_byokReadyGate)return false;for(var i=0;i<_gateRest.length;i++){if(String(u).indexOf(_gateRest[i])!==-1)return true}return false}function _byokApplyRoutes(p){if(!p||typeof p!=="object")return;_restPaths=Array.isArray(p.rest)?p.rest:[];_restSet=new Set(_restPaths);var srv=p.server||{},target=srv.externalUrl||srv.url||_byokUrl;console.log("[BYOK] routes applied: endpoint="+target+", REST="+_restPaths.length+", ConnectRPC="+((p.services||[]).length+(p.methods||[]).length)+", BYOK="+(p.byokMode?"ON":"OFF"));globalThis.__byokGlassStatus&&globalThis.__byokGlassStatus(true,!!p.byokMode);_byokRelease("routes received");_byokUrl=_byokLinkUrl||target;if(target&&target!==_byokLinkUrl){_byokProbe(target).then(function(ok){if(!ok||target===_byokLinkUrl)return;console.log("[BYOK] endpoint moved to "+target);_byokUrl=target;_byokConnect(target)})}}function _byokProbe(base){return new Promise(function(resolve){var done=false;var timer=setTimeout(function(){if(!done){done=true;resolve(false)}},1500);_origFetch(base+"/health",{cache:"no-store"}).then(function(r){return r.ok?r.json():null}).then(function(d){if(done)return;done=true;clearTimeout(timer);resolve(!!(d&&d.ok===true&&d.mode==="byok"))}).catch(function(){if(done)return;done=true;clearTimeout(timer);resolve(false)})})}function _byokDropLink(){if(!_byokLink)return;var link=_byokLink;_byokLink=null;_byokLinkUrl="";try{link.close()}catch(e){}}function _byokLinkLost(link,reason){if(_byokLink!==link)return;_byokLink=null;_byokLinkUrl="";try{link.close()}catch(e){}globalThis.__byokGlassStatus&&globalThis.__byokGlassStatus(false,void 0);if(reason==="shutdown"){_byokRetry=1000;console.log("[BYOK] server shutting down, re-discovering endpoint")}_byokSchedule()}function _byokRefresh(){console.log("[BYOK] refresh event received");globalThis.__byokRefreshModels&&globalThis.__byokRefreshModels()}function _byokWsUrl(base){return String(base).replace(/^http/,"ws")+${JSON.stringify(CHANNEL_WS_PATH)}}function _byokConnectWs(base){var ws;try{ws=new WebSocket(_byokWsUrl(base))}catch(e){_byokNoWs=true;console.log("[BYOK] WebSocket channel unavailable ("+(e&&e.message||e)+"), using SSE");_byokConnectSse(base);return}var opened=false;var link={close:function(){try{ws.close()}catch(e){}}};_byokLink=link;_byokLinkUrl=base;_byokUrl=base;ws.addEventListener("open",function(){opened=true;_byokRetry=1000;globalThis.__byokGlassStatus&&globalThis.__byokGlassStatus(true,void 0)});ws.addEventListener("message",function(ev){var m;try{m=JSON.parse(ev.data)}catch(e){console.warn("[BYOK] ws payload parse failed:",e&&e.message||e);return}if(!m||!m.event)return;if(m.event==="shutdown"){_byokLinkLost(link,"shutdown");return}if(m.event==="refresh"){_byokRefresh();return}if(m.event===${routesEvent}){_byokApplyRoutes(m.data)}});ws.addEventListener("close",function(){if(_byokLink!==link)return;if(!opened){_byokNoWs=true;_byokLink=null;_byokLinkUrl="";console.log("[BYOK] WebSocket channel refused, falling back to SSE");_byokConnectSse(base);return}_byokLinkLost(link,"closed")});}function _byokConnectSse(base){try{var es=new EventSource(base+"/byok/events");var link={close:function(){try{es.close()}catch(e){}}};_byokLink=link;_byokLinkUrl=base;_byokUrl=base;es.addEventListener("open",function(){_byokRetry=1000;globalThis.__byokGlassStatus&&globalThis.__byokGlassStatus(true,void 0)});es.addEventListener("refresh",function(){_byokRefresh()});es.addEventListener("shutdown",function(){_byokLinkLost(link,"shutdown")});es.addEventListener(${routesEvent},function(ev){try{_byokApplyRoutes(JSON.parse(ev.data))}catch(e){console.warn("[BYOK] routes payload parse failed:",e&&e.message||e)}});es.addEventListener("error",function(){_byokLinkLost(link,"error")})}catch(e){console.warn("[BYOK] EventSource init failed:",e&&e.message||e);_byokSchedule()}}function _byokConnect(base){_byokDropLink();if(_byokNoWs||typeof WebSocket==="undefined"){_byokConnectSse(base)}else{_byokConnectWs(base)}}function _byokSchedule(){if(_byokLink||_byokProbing||_byokTimer)return;var delay=_byokRetry;_byokRetry=Math.min(_byokRetry*2,10000);_byokTimer=setTimeout(function(){_byokTimer=null;_byokDiscover()},delay)}function _byokDiscover(){if(_byokProbing||_byokLink)return;_byokProbing=true;var i=0;(function next(){if(i>=_byokCandidates.length){_byokProbing=false;_byokSchedule();return}var base=_byokCandidates[i++];_byokProbe(base).then(function(ok){if(ok){_byokProbing=false;_byokConnect(base)}else{next()}})})()}_byokDiscover();`;
 }
 function buildNodeChannelSource() {
   return `var _chEs=null,_chPending=false,_chTimer=null,_chRetry=1000;function _chSchedule(){if(_chEs||_chPending||_chTimer)return;var d=_chRetry;_chRetry=Math.min(_chRetry*2,10000);_chTimer=setTimeout(function(){_chTimer=null;_chConnect()},d)}function _chReset(){_chEs=null;_chPending=false;_chSchedule()}function _chHandle(block){var lines=block.split("\\n"),ev="",data="";for(var i=0;i<lines.length;i++){var line=lines[i];if(line.indexOf("event: ")===0)ev=line.slice(7).trim();else if(line.indexOf("data: ")===0)data+=line.slice(6)}if(ev!==${JSON.stringify(SSE_EVENT_ROUTES)}||!data)return;try{applyPayload(JSON.parse(data))}catch(e){console.warn("[BYOK] "+PROCESS_LABEL+" routes payload parse failed: "+e.message)}}function _chConnect(){if(_chEs||_chPending)return;_chPending=true;var req;try{req=_directHttpRequest.call(_directHttpOwner,state.base+"/byok/events",{headers:{Accept:"text/event-stream","x-byok-route-source":PROCESS_LABEL},agent:false},function(res){_chPending=false;if(res.statusCode!==200){res.resume();_chSchedule();return}_chEs=req;_chRetry=1000;res.setEncoding("utf-8");var buf="";res.on("data",function(chunk){buf+=chunk;var parts=buf.split("\\n\\n");buf=parts.pop();for(var i=0;i<parts.length;i++)_chHandle(parts[i])});res.on("end",_chReset);res.on("error",_chReset)})}catch(e){_chPending=false;_chSchedule();return}req.on("error",_chReset);req.end()}_chConnect();`;
@@ -6932,8 +6935,26 @@ function buildNodeChannelSource() {
 var HOOK_MARKER = "__byokWrapTransport";
 var HOOK_SOURCE_MARKER = "CURSOR-BYOK-HOOK-START";
 var HOOK_CALL_SITE = `typeof globalThis.${HOOK_MARKER}==="function"?globalThis.${HOOK_MARKER}(`;
+var HOOK_HEAD_WINDOW = 12e4;
+function inspectHook(code) {
+  const head = code.slice(0, HOOK_HEAD_WINDOW);
+  const payload = head.includes(`/* ${HOOK_SOURCE_MARKER} */`);
+  const callSite = code.includes(HOOK_CALL_SITE);
+  const currentChannel = head.includes(RENDERER_CHANNEL_VERSION_MARKER);
+  return {
+    payload,
+    callSite,
+    currentChannel,
+    /** Payload and call site agree — anything else is a half-applied patch. */
+    consistent: payload === callSite,
+    upToDate: payload && callSite && currentChannel
+  };
+}
 function isInjectPatched(code) {
-  return code.slice(0, 12e4).includes(`/* ${HOOK_SOURCE_MARKER} */`) && code.includes(HOOK_CALL_SITE);
+  return inspectHook(code).upToDate;
+}
+function inspectInjectPatch(code) {
+  return inspectHook(code);
 }
 var ANCHORS = [
   "callback-client.js",
@@ -7489,12 +7510,17 @@ function checkGlassExtensionAllowlist(code) {
 }
 function patchSingleWorkbench(filePath, label, paths, log) {
   const code = (0, import_fs8.readFileSync)(filePath, "utf-8");
-  if (isInjectPatched(code)) {
+  const state = inspectHook(code);
+  if (state.upToDate) {
     log?.(`[inject] ${label}: already patched`);
     return;
   }
-  if (code.includes(HOOK_MARKER) || code.includes(HOOK_SOURCE_MARKER)) {
+  if (!state.consistent) {
     throw new Error(`${label}: partial renderer hook detected (payload/call-site mismatch)`);
+  }
+  if (state.payload) {
+    upgradeHookPayload(filePath, label, code, paths, log);
+    return;
   }
   const target = findTarget(code, log);
   log?.(`  Target: function ${target.name}(${target.paramService}, ${target.paramTransport})`);
@@ -7508,6 +7534,15 @@ function patchSingleWorkbench(filePath, label, paths, log) {
   patched = patchKatexMathSvgSanitizer(patched, log);
   patched = patchGlassExtensionAllowlist(patched, log);
   if (!patched.includes(HOOK_MARKER)) throw new Error(`Verification failed for ${label}`);
+  createBackup(filePath, "inject", log);
+  (0, import_fs8.writeFileSync)(filePath, patched);
+  updateChecksums(paths, [filePath], "inject", log);
+}
+function upgradeHookPayload(filePath, label, code, paths, log) {
+  log?.(`[inject] ${label}: payload is stale, upgrading routes channel to ${RENDERER_CHANNEL_VERSION_MARKER}`);
+  const payload = buildHookPayload(paths.hasGlass);
+  const patched = `/* ${HOOK_SOURCE_MARKER} */${payload}/* CURSOR-BYOK-HOOK-END */;${code}`;
+  if (!isInjectPatched(patched)) throw new Error(`Payload upgrade verification failed for ${label}`);
   createBackup(filePath, "inject", log);
   (0, import_fs8.writeFileSync)(filePath, patched);
   updateChecksums(paths, [filePath], "inject", log);
@@ -8973,8 +9008,9 @@ var PATCH_STEPS = [
           lines.push(line(NA, `Renderer hook (${label}): bundle not present`));
           continue;
         }
-        const injected = isInjectPatched((0, import_fs14.readFileSync)(file, "utf-8"));
-        lines.push(line(injected ? OK : FAIL, `Renderer hook ${injected ? "injected" : "not injected"} (${label})`));
+        const hook = inspectInjectPatch((0, import_fs14.readFileSync)(file, "utf-8"));
+        const note = hook.upToDate ? "injected" : hook.payload && hook.callSite ? "injected but payload is stale \u2014 re-run install" : "not injected";
+        lines.push(line(hook.upToDate ? OK : FAIL, `Renderer hook ${note} (${label})`));
       }
       return { ok: allOk(lines), lines };
     },
@@ -9100,13 +9136,18 @@ function checkRendererHook(paths, log) {
     const allowlist = checkGlassExtensionAllowlist(source);
     log?.(`  [${allowlist.ok ? "OK" : "FAIL"}] Extension allowlist (${label}): ${allowlist.detail}`);
     if (!allowlist.ok) ok5 = false;
-    if (isInjectPatched(source)) {
+    const hook = inspectInjectPatch(source);
+    if (hook.upToDate) {
       log?.(`  [OK] Renderer hook (${label}): payload + active transport call site`);
       continue;
     }
-    if (source.includes("__byokWrapTransport") || source.includes("CURSOR-BYOK-HOOK-START")) {
+    if (!hook.consistent) {
       log?.(`  [FAIL] Renderer hook (${label}) is partial (payload/call-site mismatch)`);
       ok5 = false;
+      continue;
+    }
+    if (hook.payload) {
+      log?.(`  [OK] Renderer hook (${label}): payload is stale, install will upgrade it`);
       continue;
     }
     const anchor = ["callback-client.js", "promise-client.js"].find((a) => source.includes(a));

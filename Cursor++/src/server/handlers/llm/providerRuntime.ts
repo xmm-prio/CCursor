@@ -8,6 +8,7 @@ import { resolveModel } from '../models/mapper';
 import { resetLlmTransport } from './proxyFetch';
 import { withStreamResilience } from './resilientProvider';
 import { STREAM_RETRY_POLICY } from './retryPolicy';
+import { upstreamOriginOf, withUpstreamAccounting } from './upstreamTraffic';
 import { makeByokConnectError } from '../errors';
 import { ErrorDetails_Error } from '../../gen/aiserver_v1_shared_pb';
 import type { ProviderStateStrategy } from './stateStrategy';
@@ -90,8 +91,13 @@ function instantiateProvider(entry: ProviderEntry): LLMProvider {
 function getProviderForEntry(entry: ProviderEntry): LLMProvider {
     let inst = providerInstances.get(entry.id);
     if (!inst) {
-        // 全局唯一的实例化口子 —— 在这里包一层流重试即可覆盖全部 provider
-        inst = withStreamResilience(instantiateProvider(entry), STREAM_RETRY_POLICY);
+        // 全局唯一的实例化口子 —— 在这里包装即可覆盖全部 provider。
+        // 顺序有意义: accounting 在 resilience **之内**, 所以每次重试各算一条
+        // 上游流, 退避等待期间不计占用 —— 与 socket 的真实占用区间一致。
+        inst = withStreamResilience(
+            withUpstreamAccounting(instantiateProvider(entry), upstreamOriginOf(entry.baseUrl, entry.id)),
+            STREAM_RETRY_POLICY,
+        );
         providerInstances.set(entry.id, inst);
     }
     return inst;

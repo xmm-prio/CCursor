@@ -1,4 +1,5 @@
-import type { LogEntry, LogLevel } from './logger'
+import type { EventSocketServer } from './eventSocket'
+import type { LogLevel } from './logger'
 import type { RuntimeConfigInit } from './runtime-config'
 import { fastifyConnectPlugin } from '@connectrpc/connect-fastify'
 import cors from '@fastify/cors'
@@ -10,12 +11,27 @@ import cors from '@fastify/cors'
 import Fastify from 'fastify'
 import { STREAMING_TRANSPORT_OPTIONS, tuneStreamingTransport } from './config/connectionTuning'
 import { ensureProvidersFile } from './config/providersStore'
-import { buildRoutesPayload, serializeRoutesFrames } from './config/routesPayload'
+import { buildRoutesPayload } from './config/routesPayload'
 import { ensureRoutesFile, loadRoutes, toggleByokMode } from './config/routesStore'
 import { closeAgentDatabase, initDatabase } from './database/sqlite'
+import { serveEventSocket } from './eventSocket'
+import { blobCacheDiagnostics } from './handlers/agent/blobStore'
 import { agentLinkDiagnostics } from './handlers/agent/session'
 import { streamRestartCount } from './handlers/agent/stream'
+import { upstreamTrafficSnapshot } from './handlers/llm/upstreamTraffic'
 import { enterWindowContext, logger, setLogBroadcast, setLogPush, setLogSubscriberCheck } from './logger'
+import {
+  addEventSink,
+  addLogSink,
+  broadcastLog,
+  closeAllSinks,
+  createSseSink,
+  emitEvent,
+  emitLog,
+  emitShutdown,
+  hasLogSink,
+  pushChannelDiagnostics,
+} from './pushChannel'
 import { initRuntimeConfig } from './runtime-config'
 import routes from './services'
 
@@ -38,52 +54,16 @@ const TRACE_PATHS = new Set([
 ])
 
 let app: any = null
+let eventSocketServer: EventSocketServer | null = null
 
-// ── SSE 日志分发 (per-windowId) ──
+// ── 推送通道 ──
+//
+// 订阅者登记、背压与两种传输的编码都在 pushChannel.ts, WebSocket 的 upgrade
+// 接管在 eventSocket.ts; 本文件只负责把 HTTP 端点接到那些注册函数上。
 //
 // windowId 从请求头 x-client-wid 直接读取 — 由 renderer inject-patch 注入,
 // 值来自 window.vscodeWindowId。Extension host 侧通过解析 VSCODE_PROCESS_TITLE
 // 中的 [N-M] 得到相同的 N, 两边自然对齐, 无需任何映射表。
-
-/** windowId → SSE response set (extension host 订阅) */
-const logStreams = new Map<number, Set<any>>()
-
-/** 查询 windowId 是否有 SSE 订阅者 (Editor 窗口有, Agent Window 没有) */
-export function hasLogSubscriber(windowId: number): boolean {
-  const s = logStreams.get(windowId)
-  return !!s && s.size > 0
-}
-
-/** 向指定 windowId 的所有 SSE 连接推送结构化日志 */
-export function pushLog(windowId: number, entry: LogEntry): void {
-  const streams = logStreams.get(windowId)
-  if (!streams || streams.size === 0)
-    return
-  const data = `data: ${JSON.stringify(entry)}\n\n`
-  for (const reply of streams) {
-    try {
-      reply.raw.write(data)
-    }
-    catch {
-      streams.delete(reply)
-    }
-  }
-}
-
-/** 向所有 SSE 连接广播结构化日志 (系统级日志, 无特定 windowId) */
-export function broadcastLog(entry: LogEntry): void {
-  const data = `data: ${JSON.stringify(entry)}\n\n`
-  for (const [, streams] of logStreams) {
-    for (const reply of streams) {
-      try {
-        reply.raw.write(data)
-      }
-      catch {
-        streams.delete(reply)
-      }
-    }
-  }
-}
 
 /** 从请求头 x-client-wid 读取 windowId (由 inject-patch 注入) */
 function resolveWindowId(req: any): number | null {
@@ -109,8 +89,6 @@ function resolveWindowId(req: any): number | null {
  * 替换了早期的轮询方案 (renderer 每 3s GET /byok/refresh-signal + counter 对比)。
  * Push 模式零心跳,消除了 trace 级别的轮询噪声,同时响应更及时。
  */
-const refreshEventStreams = new Set<any>()
-
 let refreshDebounceTimer: ReturnType<typeof setTimeout> | null = null
 
 export function bumpRefreshSignal(): void {
@@ -118,16 +96,7 @@ export function bumpRefreshSignal(): void {
     clearTimeout(refreshDebounceTimer)
   refreshDebounceTimer = setTimeout(() => {
     refreshDebounceTimer = null
-    let sent = 0
-    for (const reply of refreshEventStreams) {
-      try {
-        reply.raw.write(`event: refresh\ndata: {}\n\n`)
-        sent++
-      }
-      catch {
-        refreshEventStreams.delete(reply)
-      }
-    }
+    const sent = emitEvent({ kind: 'refresh' })
     logger.info({ connections: sent }, '[SRV] refresh signal pushed')
   }, 500)
 }
@@ -145,23 +114,13 @@ export function bumpRefreshSignal(): void {
  * Wire compatibility: serializeRoutesFrames() emits the legacy `routes` frame
  * next to `routes-v2`, so hooks injected by an older installer keep working.
  */
-function currentRoutesFrames(): string {
-  return serializeRoutesFrames(buildRoutesPayload(loadRoutes()))
+function currentRoutesPayload() {
+  return buildRoutesPayload(loadRoutes())
 }
 
 export function pushRoutesUpdate(): void {
-  const payload = buildRoutesPayload(loadRoutes())
-  const frames = serializeRoutesFrames(payload)
-  let sent = 0
-  for (const reply of refreshEventStreams) {
-    try {
-      reply.raw.write(frames)
-      sent++
-    }
-    catch {
-      refreshEventStreams.delete(reply)
-    }
-  }
+  const payload = currentRoutesPayload()
+  const sent = emitEvent({ kind: 'routes', payload })
   logger.info(
     {
       connections: sent,
@@ -250,15 +209,20 @@ export async function startServer(opts: StartServerOptions): Promise<{ host: str
   await server.register(cors, { origin: true })
   await server.register(fastifyConnectPlugin, { routes })
 
-  // ── SSE 日志流 + 窗口注册 ──
+  // ── 推送通道端点 + 窗口注册 ──
 
-  // 诊断端点 — SSE 连接状态 (log-stream per-window + events 广播) + agent 链路健康
+  /**
+   * Diagnostics — everything needed to answer "is this server the bottleneck".
+   *
+   * Under several workspaces the same three questions come up: is a turn stuck
+   * on the editor link (`agentLink`), is it stuck waiting for a provider socket
+   * (`upstream`), and is a window silently losing output or holding memory
+   * (`pushChannel`, `blobCache`).
+   */
   server.get('/byok/debug', async () => ({
-    logStreams: Array.from(logStreams.entries()).map(([wid, set]) => ({
-      windowId: wid,
-      connections: set.size,
-    })),
-    refreshEventConnections: refreshEventStreams.size,
+    pushChannel: pushChannelDiagnostics(),
+    upstream: upstreamTrafficSnapshot(),
+    blobCache: blobCacheDiagnostics(),
     agentLink: {
       ...agentLinkDiagnostics(),
       streamRestarts: streamRestartCount(),
@@ -282,35 +246,33 @@ export async function startServer(opts: StartServerOptions): Promise<{ host: str
       reply.code(400).send({ error: 'windowId required' })
       return
     }
-    if (!logStreams.has(wid))
-      logStreams.set(wid, new Set())
-    logStreams.get(wid)!.add(reply)
 
     reply.raw.writeHead(200, sseHeaders)
-    reply.raw.write(`data: ${JSON.stringify(`[INFO] log stream connected (windowId=${wid})`)}\n\n`)
+    const sink = createSseSink(reply.raw)
+    const unsubscribe = addLogSink(wid, sink)
+    sink.write({ kind: 'log', entry: { level: 'info', msg: `[SRV] log stream connected (windowId=${wid})` } })
     // hijack: 不让 Fastify 关闭 response
     reply.hijack()
 
-    req.raw.on('close', () => {
-      logStreams.get(wid)?.delete(reply)
-    })
+    req.raw.on('close', unsubscribe)
   })
 
-  // Renderer SSE 订阅 — refresh 事件推送 (BYOK mode / providers 变更时触发模型列表刷新)
-  // 广播式: 所有 renderer 都订阅同一条流, 不按窗口过滤,
-  // 因为 providers / routes 变更是全局事件, 每个窗口都需要刷新。
+  // Renderer / node router SSE 订阅 — routes + refresh 推送。
+  // 广播式: 不按窗口过滤, 因为 providers / routes 变更是全局事件。
+  //
+  // 同一通道另有 WebSocket 形态 (见 BYOK_WS_PATH); 两者共用同一套订阅登记,
+  // 消费方任选其一即可。
   server.get('/byok/events', async (req, reply) => {
-    refreshEventStreams.add(reply)
     reply.raw.writeHead(200, sseHeaders)
-    reply.raw.write(`: connected\n\n`)
+    const sink = createSseSink(reply.raw)
+    const unsubscribe = addEventSink(sink)
+    sink.write({ kind: 'comment', text: 'connected' })
     // 立即下发当前 routes — 消费方 (renderer hook / node router) 初始只含 BASE,
     // 这一帧同时解除 renderer 的启动期就绪门控
-    reply.raw.write(currentRoutesFrames())
+    sink.write({ kind: 'routes', payload: currentRoutesPayload() })
     reply.hijack()
 
-    req.raw.on('close', () => {
-      refreshEventStreams.delete(reply)
-    })
+    req.raw.on('close', unsubscribe)
   })
 
   // BYOK toggle — renderer (glass sidebar) 通过 fetch 调用
@@ -352,16 +314,23 @@ export async function startServer(opts: StartServerOptions): Promise<{ host: str
   server.post('/auth/logout', async () => ({ ok: true }))
   server.get('/auth/poll', async () => ({ accessToken: 'byok-token', authId: 'byok-user' }))
 
-  // 日志分发回调: 请求内 → pushLog (per-window), 请求外 → broadcastLog (所有窗口)
+  // WebSocket 形态的事件通道 —— 与 /byok/events 同源同载荷, 不同 socket 池。
+  const eventSocket = serveEventSocket(server.server, currentRoutesPayload)
+
+  // 日志分发回调: 请求内 → emitLog (per-window), 请求外 → broadcastLog (所有窗口)
   setLogBroadcast(broadcastLog)
-  setLogPush(pushLog)
-  setLogSubscriberCheck(hasLogSubscriber)
+  setLogPush(emitLog)
+  setLogSubscriberCheck(hasLogSink)
 
   try {
     await server.listen({ port, host })
   }
   catch (err) {
     app = null
+    try {
+      eventSocket.close()
+    }
+    catch { /* noop */ }
     try {
       await server.close()
     }
@@ -373,28 +342,15 @@ export async function startServer(opts: StartServerOptions): Promise<{ host: str
     throw err
   }
   app = server
+  eventSocketServer = eventSocket
   logger.info(`[SRV] listening at http://${host}:${port}`)
 
   return { host, port }
 }
 
 export function broadcastShutdown(): void {
-  const msg = `event: shutdown\ndata: {}\n\n`
-  for (const [, streams] of logStreams) {
-    for (const reply of streams) {
-      try {
-        reply.raw.write(msg)
-      }
-      catch { /* noop */ }
-    }
-  }
-  for (const reply of refreshEventStreams) {
-    try {
-      reply.raw.write(msg)
-    }
-    catch { /* noop */ }
-  }
-  logger.info('[SRV] shutdown broadcast sent')
+  const delivered = emitShutdown()
+  logger.info({ subscribers: delivered }, '[SRV] shutdown broadcast sent')
 }
 
 export async function stopServer(): Promise<void> {
@@ -403,6 +359,13 @@ export async function stopServer(): Promise<void> {
   const server = app
   app = null
   broadcastShutdown()
+  // Order matters: the peers must hear the shutdown before their streams are
+  // cut, and every stream must be cut before close() — see closeAllSinks().
+  closeAllSinks()
+  if (eventSocketServer) {
+    eventSocketServer.close()
+    eventSocketServer = null
+  }
   try {
     await server.close()
   }

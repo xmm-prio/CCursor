@@ -53,9 +53,10 @@ export const TCP_KEEPALIVE_DELAY_MS = 15_000
 /**
  * Fastify options that disable every whole-request deadline.
  *
- * Both are already the Fastify 5 defaults; they are stated explicitly because
- * "a streaming turn has no duration limit" is a property of this server, not
- * something to inherit from a framework default that may change.
+ * The two timeouts are already the Fastify 5 defaults; they are stated
+ * explicitly because "a streaming turn has no duration limit" is a property of
+ * this server, not something to inherit from a framework default that may
+ * change.
  */
 export const STREAMING_TRANSPORT_OPTIONS = {
   /** 0 = no limit on how long one request may take, including the response. */
@@ -63,6 +64,19 @@ export const STREAMING_TRANSPORT_OPTIONS = {
   /** 0 = no limit on how long a socket may live. */
   connectionTimeout: 0,
   keepAliveTimeout: KEEP_ALIVE_TIMEOUT_MS,
+  /**
+   * The flip side of having no deadlines: nothing may hold the port hostage
+   * when the owner window goes away.
+   *
+   * Fastify's default ('idle') waits for every active request to finish, and
+   * this server's traffic is mostly requests that are *designed* never to
+   * finish — push subscriptions and agent turns. Waiting for them means the
+   * listening socket stays bound long after the window closed, and every peer
+   * window's takeover attempt fails against a port that is still taken.
+   * Deactivation is exactly the moment those streams are worthless, so they are
+   * cut rather than awaited.
+   */
+  forceCloseConnections: true,
 } as const
 
 /**

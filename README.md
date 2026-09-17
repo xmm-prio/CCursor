@@ -97,6 +97,10 @@ skipped; override with `CCURSOR_CURSOR_ROOT=<path to resources/app>`.
 > Upgrading from a previous install? Run `uninstall` before `install`. The
 > injected router carries a version marker, and stacking a new install on top of
 > old patches will not take effect.
+>
+> `status` names this case explicitly — a bundle patched by an older installer
+> is reported as *"payload is stale — re-run install"* rather than as a healthy
+> install, so a shipped fix cannot silently fail to reach you.
 
 ---
 
@@ -111,6 +115,7 @@ skipped; override with `CCURSOR_CURSOR_ROOT=<path to resources/app>`.
 - **Hot-Reload** — Config changes take effect without restarting Cursor
 - **Native Agent Tools** — Shell, Read, Grep, Glob, Edit, Write, Task, MCP, plus the `cursor` dynamic namespace (ConnectScm, SearchConversations, SetActiveBranch, CreateGoal, UpdateGoal, WriteShellStdin)
 - **Remote SSH** — A headless companion extension serves the remote host while the local side keeps the UI
+- **Multi-Window Concurrency** — One machine-wide server tuned for many workspaces streaming at once ([details](#multi-window-concurrency))
 
 ---
 
@@ -121,6 +126,7 @@ Cursor IDE
   │
   ├─ inject-patch (renderer)
   │   └─ intercept ConnectRPC + REST → route to BYOK server
+  │       + push channel: WebSocket /byok/ws (fallback: SSE /byok/events)
   │
   ├─ always-local-patch (extension host)
   │   └─ rewrite http/https.request + hot-reload from routes.json
@@ -133,6 +139,72 @@ Cursor IDE
 ```
 
 All patches create backup files and are fully reversible via `uninstall`.
+
+---
+
+## Multi-Window Concurrency
+
+There is exactly **one BYOK server per machine**: the first Cursor window to bind
+`:39831` owns it, every other window becomes a peer that routes into it. With
+several workspaces open, all agents — and every subagent they spawn — therefore
+share one process and one set of connection pools. The constraints below exist
+for that shape.
+
+### Upstream connection pool
+
+One agent turn holds one socket of its provider's origin for the whole turn,
+typically minutes. Once the pool is full, undici parks further requests in an
+internal queue with **no timeout, no event and no log line**, which looks like
+"the agent never produces a first token".
+
+`UPSTREAM_MAX_CONNECTIONS_PER_ORIGIN` is therefore 64 (see
+`src/server/config/upstreamTuning.ts`), so the binding constraint becomes the
+provider's own rate limiter — a 429 that `retryPolicy.ts` classifies as
+retryable and backs off from, which a local queue never does. Sockets are
+created lazily, so the ceiling costs nothing while the server is idle.
+
+The server logs a warning at the moment an origin **crosses** the pool ceiling
+rather than on every request, because the useful fact is when queueing starts.
+
+### Push channel prefers WebSocket
+
+A renderer gets six HTTP/1.1 sockets per origin, and Chromium shares that budget
+across every Cursor window rather than giving each one its own. An SSE
+subscription is a request that never completes, so each open workspace
+permanently spends one of the six; once they are gone, every ordinary request to
+the BYOK port queues behind streams that by design never end.
+
+The renderer now prefers WebSocket (`/byok/ws`), which is drawn from a separate
+and far larger pool. The SSE endpoint `/byok/events` remains as the fallback: if
+a Content-Security-Policy forbids `ws:`, the channel degrades instead of
+disappearing, and the fallback is sticky for the session (a CSP does not change
+at runtime, so re-probing on every reconnect would only add latency).
+
+### Backpressure and memory
+
+- Log delivery has a 1 MiB buffer budget per subscriber. When a window stops
+  reading — a suspended laptop, a congested SSH tunnel — its log frames are
+  dropped instead of accumulating without limit inside the shared process, and
+  the window is told how much it missed once it drains. Event frames (routes,
+  refresh) are exempt: the consumer cannot re-derive that state.
+- The in-memory blob cache bounds itself (20 000 entries / 128 MiB, LRU).
+  Eviction is safe because every blob is also written to sqlite and
+  `warmupBlobsAsync` reads it back on a miss.
+- Shutdown broadcasts, then hangs up on subscribers, then force-closes
+  connections. Push subscriptions and agent turns are requests designed never to
+  finish; without this the listening socket stays bound after the owner window
+  closes and every peer's takeover attempt fails.
+
+### Diagnosing
+
+`curl http://127.0.0.1:39831/byok/debug` answers four questions:
+
+| Field | Question |
+|---|---|
+| `upstream` | how many streams are open per origin, the peak, how often the pool ceiling was crossed |
+| `pushChannel` | subscribers per channel and transport, log frames dropped |
+| `blobCache` | memory held by the cache, entries evicted |
+| `agentLink` | whether the editor uplink lost messages, how often streams restarted |
 
 ---
 
