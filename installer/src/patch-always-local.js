@@ -33,8 +33,9 @@ export function patchAlwaysLocal(paths, log) {
   const original = readFileSync(paths.alwaysLocalMain, 'utf-8');
   let patched = original;
 
-  // 1. Shared process-local router. Prepending V2 also safely upgrades older
-  //    installations: it sets the historical guard before the old payload runs.
+  // 1. Shared process-local router. Prepending the current payload also safely
+  //    upgrades older installations: it sets the historical guard before the
+  //    stale payload further down the bundle runs.
   if (!isNodeHttp11RouterPatched(patched, ALWAYS_LOCAL_ROUTER_MARKER)) {
     patched = buildPayload() + patched;
     log?.('  HTTP/1.1 whitelist router injected');
