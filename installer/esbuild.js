@@ -18,7 +18,9 @@ await esbuild.build({
   banner: {
     js: '#!/usr/bin/env node',
   },
-  external: ['acorn'],
+  // Nothing is external: the CLI must run straight from a git clone with no
+  // `npm install` step, which also sidesteps locked-down npx cache dirs.
+  external: [],
   define: {
     'process.env.CURSOR2PLUS_VERSION': JSON.stringify(pkg.version),
   },

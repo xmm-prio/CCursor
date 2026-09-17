@@ -56,6 +56,18 @@ npx git+https://github.com/xmm-prio/CCursor.git install
 
 要求 **Node.js >= 18**，仅此而已 —— CLI 与扩展包都已提交到仓库，安装时不会在你机器上执行任何构建。
 
+### npx 跑不通时：从克隆安装
+
+在受管控或装有杀软的机器上，`npx` 可能在解压到缓存目录时失败 —— 典型表现是出现 `npm warn cleanup ... EPERM`，并且 **CLI 完全没有任何输出**，因为命令 shim 根本没建成。这种情况直接绕开 npx：
+
+```bash
+git clone https://github.com/xmm-prio/CCursor.git
+cd CCursor
+node installer/dist/cli.cjs install
+```
+
+CLI 打包后**没有任何运行时依赖**，所以这里不需要执行 `npm install` —— 有 `git clone` 和 `node` 就够了。
+
 ### 安装之后
 
 打补丁只是把流量劫持到本地 BYOK 服务器，而服务器提供哪些模型取决于配置。**全新安装时 `~/.ccursor/providers.json` 是空的，Cursor 里看不到任何自定义模型，看起来就像"没有有效安装"。** 请重启 Cursor，打开侧边栏 Cursor++ 面板添加服务商，或直接编辑 `providers.json`（格式见[配置](#配置)一节）。

@@ -56,6 +56,22 @@ npx git+https://github.com/xmm-prio/CCursor.git install
 Requires **Node.js >= 18**. Nothing else — the CLI bundle and the packaged
 extension are committed to this repository, so no build step runs on your machine.
 
+### If `npx` fails: install from a clone
+
+On locked-down or antivirus-managed machines, `npx` can fail while extracting
+into its cache — typically showing `npm warn cleanup ... EPERM` and **no output
+from the CLI at all**, because the command shim was never created. Bypass npx
+entirely:
+
+```bash
+git clone https://github.com/xmm-prio/CCursor.git
+cd CCursor
+node installer/dist/cli.cjs install
+```
+
+The CLI bundle has **no runtime dependencies**, so there is no `npm install`
+step here — `git clone` and `node` are all you need.
+
 ### After installing
 
 Patching only redirects traffic to the local BYOK server — the server still
